@@ -4565,6 +4565,109 @@ async def test_async_data_generator_cleanup_on_normal_completion():
 
 
 @pytest.mark.asyncio
+async def test_async_data_generator_google_native_sse_passthrough_preserves_split_chunks():
+    """
+    Google native streamGenerateContent returns raw SSE bytes. Network chunks can
+    split a single SSE event, so the proxy must not add SSE delimiters per byte chunk
+    or append OpenAI's [DONE] sentinel.
+    """
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.proxy_server import async_data_generator
+    from litellm.proxy.utils import ProxyLogging
+
+    class AsyncGoogleGenAIGenerateContentStreamingIterator:
+        __module__ = "litellm.google_genai.streaming_iterator"
+
+    mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+    mock_request_data = {
+        "model": "gemini-2.5-flash",
+        "contents": [{"role": "user", "parts": [{"text": "test"}]}],
+        "stream": True,
+    }
+    split_sse_chunks = [
+        b'data: {"candidates":',
+        b'[{"content":{"parts":[{"text":"hello"}],"role":"model"}}]}\n\n',
+    ]
+
+    mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+
+    async def mock_streaming_iterator(*args, **kwargs):
+        for chunk in split_sse_chunks:
+            yield chunk
+
+    mock_proxy_logging_obj.async_post_call_streaming_iterator_hook = (
+        mock_streaming_iterator
+    )
+    mock_proxy_logging_obj.async_post_call_streaming_hook = AsyncMock(
+        side_effect=lambda **kwargs: kwargs.get("response")
+    )
+    mock_proxy_logging_obj.post_call_failure_hook = AsyncMock()
+
+    native_google_response = AsyncGoogleGenAIGenerateContentStreamingIterator()
+    native_google_response.aclose = AsyncMock()
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj", mock_proxy_logging_obj):
+        yielded_data = []
+        async for data in async_data_generator(
+            native_google_response, mock_user_api_key_dict, mock_request_data
+        ):
+            yielded_data.append(data)
+
+    assert yielded_data == split_sse_chunks
+    assert all(b"[DONE]" not in chunk for chunk in yielded_data)
+    native_google_response.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_data_generator_raw_sse_bytes_passthrough_skips_done():
+    """
+    Google adapter streams can be plain async generators that yield preformatted
+    SSE bytes. Once raw SSE passthrough is detected, the proxy must not append
+    OpenAI's [DONE] sentinel.
+    """
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.proxy_server import async_data_generator
+    from litellm.proxy.utils import ProxyLogging
+
+    mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+    mock_request_data = {
+        "model": "gemini-adapter-model",
+        "contents": [{"role": "user", "parts": [{"text": "test"}]}],
+        "stream": True,
+    }
+    raw_sse_chunks = [
+        b'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}\n\n',
+    ]
+
+    mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+
+    async def mock_streaming_iterator(*args, **kwargs):
+        for chunk in raw_sse_chunks:
+            yield chunk
+
+    mock_proxy_logging_obj.async_post_call_streaming_iterator_hook = (
+        mock_streaming_iterator
+    )
+    mock_proxy_logging_obj.async_post_call_streaming_hook = AsyncMock(
+        side_effect=lambda **kwargs: kwargs.get("response")
+    )
+    mock_proxy_logging_obj.post_call_failure_hook = AsyncMock()
+
+    mock_response = MagicMock()
+    mock_response.aclose = AsyncMock()
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj", mock_proxy_logging_obj):
+        yielded_data = []
+        async for data in async_data_generator(
+            mock_response, mock_user_api_key_dict, mock_request_data
+        ):
+            yielded_data.append(data)
+
+    assert yielded_data == raw_sse_chunks
+    mock_response.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_async_data_generator_cleanup_on_midstream_error():
     """
     Test that async_data_generator calls response.aclose() via finally block
