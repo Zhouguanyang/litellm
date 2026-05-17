@@ -6862,6 +6862,18 @@ def _format_streaming_sse_chunk(chunk: Union[str, bytes]) -> Union[str, bytes]:
     return f"data: {chunk}\n\n"
 
 
+def _is_google_native_sse_stream(response: Any) -> bool:
+    response_cls = response.__class__
+    return (
+        response_cls.__module__ == "litellm.google_genai.streaming_iterator"
+        and response_cls.__name__
+        in {
+            "GoogleGenAIGenerateContentStreamingIterator",
+            "AsyncGoogleGenAIGenerateContentStreamingIterator",
+        }
+    )
+
+
 async def async_data_generator(  # noqa: PLR0915
     response, user_api_key_dict: UserAPIKeyAuth, request_data: dict
 ):
@@ -6887,6 +6899,7 @@ async def async_data_generator(  # noqa: PLR0915
         # happened to ship a streaming-iterator override (the default).
         needs_iterator_wrap = proxy_logging_obj.needs_iterator_wrap()
         needs_per_chunk_hook = proxy_logging_obj.needs_per_chunk_streaming_hook()
+        raw_sse_passthrough = _is_google_native_sse_stream(response)
 
         if needs_iterator_wrap:
             stream_iterator = proxy_logging_obj.async_post_call_streaming_iterator_hook(
@@ -6907,6 +6920,13 @@ async def async_data_generator(  # noqa: PLR0915
                     str_so_far=_str_so_far,
                 )
 
+            if raw_sse_passthrough and isinstance(chunk, (bytes, bytearray, str)):
+                try:
+                    yield bytes(chunk) if isinstance(chunk, bytearray) else chunk
+                except Exception as e:
+                    yield f"data: {str(e)}\n\n"
+                continue
+
             chunk, model_mismatch_logged = _restamp_streaming_chunk_model(
                 chunk=chunk,
                 requested_model_from_client=requested_model_from_client,
@@ -6916,6 +6936,16 @@ async def async_data_generator(  # noqa: PLR0915
 
             if isinstance(chunk, BaseModel):
                 chunk = _serialize_streaming_chunk(chunk)
+            elif isinstance(chunk, (bytes, bytearray)):
+                raw_chunk = bytes(chunk)
+                chunk = raw_chunk.decode("utf-8", errors="replace")
+                if chunk.startswith(("data:", "event:", ":")):
+                    raw_sse_passthrough = True
+                    try:
+                        yield raw_chunk
+                    except Exception as e:
+                        yield f"data: {str(e)}\n\n"
+                    continue
             elif isinstance(chunk, str) and chunk.startswith("data: "):
                 error_message = chunk
                 break
@@ -6934,8 +6964,9 @@ async def async_data_generator(  # noqa: PLR0915
         # Streaming is done, yield the [DONE] chunk
         if error_message is not None:
             yield error_message
-        done_message = "[DONE]"
-        yield f"data: {done_message}\n\n"
+        if not raw_sse_passthrough:
+            done_message = "[DONE]"
+            yield f"data: {done_message}\n\n"
     except Exception as e:
         verbose_proxy_logger.exception(
             "litellm.proxy.proxy_server.async_data_generator(): Exception occured - {}".format(
