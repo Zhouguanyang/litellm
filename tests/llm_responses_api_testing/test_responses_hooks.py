@@ -397,9 +397,7 @@ def test_process_chunk_completed_response_updates_id_and_usage_cost(monkeypatch)
         # Chunk must include a top-level "response" key so BaseResponsesAPIStreamingIterator
         # runs _update_responses_api_response_id_with_model_id (see streaming_iterator.py).
         event = iterator._process_chunk(
-            json.dumps(
-                {"type": "response.completed", "response": {"id": "resp_live"}}
-            )
+            json.dumps({"type": "response.completed", "response": {"id": "resp_live"}})
         )
     finally:
         litellm.include_cost_in_streaming_usage = original_include_cost
@@ -408,6 +406,82 @@ def test_process_chunk_completed_response_updates_id_and_usage_cost(monkeypatch)
     assert event.response.id != "resp_live"
     assert event.response.id.startswith("resp_")
     assert event.response.usage.cost == 1.23
+    completion_handler.assert_called_once()
+
+
+def test_completed_response_logging_copy_reconstructs_empty_output(monkeypatch):
+    openai_types = streaming_module._get_openai_response_types()
+    completed_output_item = {
+        "id": "msg_live",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "hello from streamed output",
+                "annotations": [],
+            }
+        ],
+    }
+
+    class _StreamingConfig:
+        def transform_streaming_response(self, **kwargs):
+            parsed_chunk = kwargs["parsed_chunk"]
+            if parsed_chunk["type"] == "response.output_item.done":
+                return openai_types.OutputItemDoneEvent(
+                    type=openai_types.ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                    output_index=0,
+                    sequence_number=1,
+                    item=completed_output_item,
+                )
+            return openai_types.ResponseCompletedEvent(
+                type=openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+                response=ResponsesAPIResponse(
+                    id="resp_live",
+                    created_at=int(datetime.now().timestamp()),
+                    status="completed",
+                    model="test-model",
+                    object="response",
+                    output=[],
+                    usage=openai_types.ResponseAPIUsage(
+                        input_tokens=1,
+                        output_tokens=2,
+                        total_tokens=3,
+                    ),
+                ),
+            )
+
+    logging_obj = _FakeLoggingObj()
+    iterator = ResponsesAPIStreamingIterator(
+        response=httpx.Response(200),
+        model="test-model",
+        responses_api_provider_config=_StreamingConfig(),
+        logging_obj=logging_obj,
+        litellm_metadata={"model_info": {"id": "model-123"}},
+        custom_llm_provider="openai",
+        request_data={"foo": "bar"},
+        call_type=CallTypes.responses.value,
+    )
+    completion_handler = MagicMock()
+    monkeypatch.setattr(
+        iterator, "_handle_logging_completed_response", completion_handler
+    )
+
+    output_item_done_event = iterator._process_chunk(
+        json.dumps({"type": "response.output_item.done"})
+    )
+    completed_event = iterator._process_chunk(
+        json.dumps({"type": "response.completed", "response": {"id": "resp_live"}})
+    )
+
+    assert output_item_done_event is not None
+    assert completed_event is not None
+    assert completed_event.response.output == []
+    assert iterator.completed_response is not completed_event
+    assert iterator.completed_response.response.output[0]["content"][0]["text"] == (
+        "hello from streamed output"
+    )
     completion_handler.assert_called_once()
 
 
