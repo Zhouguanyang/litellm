@@ -16,6 +16,11 @@ from litellm.constants import SENTRY_DENYLIST, SENTRY_PII_DENYLIST
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LitellmLogging
 from litellm.litellm_core_utils.litellm_logging import set_callbacks
+from litellm.types.llms.openai import (
+    ResponseCompletedEvent,
+    ResponsesAPIResponse,
+    ResponsesAPIStreamEvents,
+)
 from litellm.types.utils import ModelResponse, TextCompletionResponse
 
 
@@ -2380,6 +2385,43 @@ def test_get_assembled_streaming_response_returns_none_for_non_streaming_text_co
         streaming_chunks=[],
     )
     assert assembled is None
+
+
+def test_get_assembled_streaming_response_handles_responses_event_with_dict_response():
+    """Responses API stream events may hold response as a dict after model_construct."""
+    import datetime
+
+    logging_obj = _make_logging_obj(stream=True)
+    result = ResponseCompletedEvent.model_construct(
+        type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+        response={
+            "id": "resp-1",
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "completed",
+            "model": "gpt-5.5",
+            "usage": {
+                "input_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 21,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 41,
+            },
+        },
+    )
+
+    assembled = logging_obj._get_assembled_streaming_response(
+        result=result,
+        start_time=datetime.datetime.now(),
+        end_time=datetime.datetime.now(),
+        is_async=True,
+        streaming_chunks=[],
+    )
+
+    assert isinstance(assembled, ResponsesAPIResponse)
+    assert assembled.usage["prompt_tokens"] == 20
+    assert assembled.usage["completion_tokens"] == 21
+    assert assembled.usage["total_tokens"] == 41
 
 
 @pytest.mark.asyncio
