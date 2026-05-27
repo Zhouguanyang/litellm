@@ -1718,6 +1718,87 @@ def test_process_chunk_completed_response_updates_id_and_usage_cost(monkeypatch)
     assert event.response.usage.cost == 1.23
     completion_handler.assert_called_once()
 
+def test_completed_response_logging_copy_reconstructs_empty_output(monkeypatch):
+    openai_types = streaming_module.get_openai_response_types()
+    completed_output_item = {
+        "id": "msg_live",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "output_text",
+                "text": "hello from streamed output",
+                "annotations": [],
+            }
+        ],
+    }
+
+    class _StreamingConfig:
+        def transform_streaming_response(self, **kwargs):
+            parsed_chunk = kwargs["parsed_chunk"]
+            if parsed_chunk["type"] == "response.output_item.done":
+                return openai_types.OutputItemDoneEvent(
+                    type=openai_types.ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                    output_index=0,
+                    sequence_number=1,
+                    item=completed_output_item,
+                )
+            response: Final = ResponsesAPIResponse(
+                id="resp_live",
+                created_at=int(datetime.now().timestamp()),
+                status="completed",
+                model="test-model",
+                object="response",
+                output=[],
+                usage=openai_types.ResponseAPIUsage(
+                    input_tokens=1,
+                    output_tokens=2,
+                    total_tokens=3,
+                ),
+            )
+            response._hidden_params["additional_headers"] = {"llm_provider-request-id": "from-transform"}
+            return openai_types.ResponseCompletedEvent(
+                type=openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+                response=response,
+            )
+
+    logging_obj = _FakeLoggingObj()
+    iterator = ResponsesAPIStreamingIterator(
+        response=httpx.Response(200),
+        model="test-model",
+        responses_api_provider_config=_StreamingConfig(),
+        logging_obj=logging_obj,
+        litellm_metadata={"model_info": {"id": "model-123"}},
+        custom_llm_provider="openai",
+        request_data={"foo": "bar"},
+        call_type=CallTypes.responses.value,
+    )
+    completion_handler = MagicMock()
+    monkeypatch.setattr(
+        iterator, "_handle_logging_completed_response", completion_handler
+    )
+
+    output_item_done_event = iterator._process_chunk(
+        json.dumps({"type": "response.output_item.done"})
+    )
+    completed_event = iterator._process_chunk(
+        json.dumps({"type": "response.completed", "response": {"id": "resp_live"}})
+    )
+
+    assert output_item_done_event is not None
+    assert completed_event is not None
+    assert completed_event.response.output == []
+    assert iterator.completed_response is not completed_event
+    assert iterator.completed_response.response.output[0]["content"][0]["text"] == (
+        "hello from streamed output"
+    )
+    assert iterator.completed_response.response._hidden_params["additional_headers"] == {
+        "llm_provider-request-id": "from-transform"
+    }
+    completion_handler.assert_called_once()
+
+
 @pytest.mark.usefixtures("_vcr_outcome_gate", "setup_and_teardown")
 def test_process_chunk_failed_response_triggers_failure_logging(monkeypatch):
     openai_types = streaming_module._get_openai_response_types()

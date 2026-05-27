@@ -15,7 +15,11 @@ from pydantic import TypeAdapter
 
 import litellm
 from litellm.caching.llm_caching_handler import LLMClientCache
-from litellm.integrations.langfuse.langfuse import LangFuseLogger
+from litellm.integrations.langfuse.langfuse import (
+    LangFuseLogger,
+    _extract_cache_read_input_tokens,
+    _get_langfuse_token_usage,
+)
 from litellm.integrations.langfuse.langfuse_prompt_management import langfuse_client_init
 from litellm.integrations.langfuse.langfuse_sdk import (
     flush_langfuse_tracing,
@@ -27,6 +31,7 @@ from litellm.litellm_core_utils.litellm_logging import DynamicLoggingCache as Le
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.litellm_core_utils.thread_pool_executor import MAX_THREADS, executor
 from litellm.llms.custom_httpx.http_handler import HTTPHandler
+from litellm.types.llms.openai import ResponseAPIUsage
 
 _EXPORT_URL: Final = "https://langfuse.unit/api/public/otel/v1/traces"
 _VOLATILE_ATTRIBUTES: Final = frozenset(
@@ -42,6 +47,18 @@ _VOLATILE_ATTRIBUTES: Final = frozenset(
         "langfuse.observation.metadata.usage_object",
     }
 )
+
+
+def test_langfuse_token_usage_supports_responses_api_usage() -> None:
+    usage: Final = ResponseAPIUsage(
+        input_tokens=13,
+        input_tokens_details={"cached_tokens": 3},
+        output_tokens=21,
+        total_tokens=34,
+    )
+
+    assert _get_langfuse_token_usage(usage) == (13, 21, 34)
+    assert _extract_cache_read_input_tokens(usage) == 3
 
 
 def _decode_attribute(value: AnyValue) -> object:
