@@ -3119,24 +3119,44 @@ class Logging(LiteLLMLoggingBaseClass):
             result,
             (ResponseCompletedEvent, ResponseIncompleteEvent, ResponseFailedEvent),
         ):
+            response = self._coerce_responses_api_streaming_event_response(response=getattr(result, "response", None))
+            if response is None:
+                return None
+
             ## return unified Usage object
-            if isinstance(result.response.usage, ResponseAPIUsage):
-                transformed_usage = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
-                    result.response.usage
-                )
+            usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+            if isinstance(usage, ResponseAPIUsage) or (
+                isinstance(usage, dict) and ResponseAPILoggingUtils._is_response_api_usage(usage)
+            ):
+                transformed_usage = ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(usage)
                 # Set as dict instead of Usage object so model_dump() serializes it correctly
-                setattr(
-                    result.response,
-                    "usage",
-                    (
-                        transformed_usage.model_dump()
-                        if hasattr(transformed_usage, "model_dump")
-                        else dict(transformed_usage)
-                    ),
+                transformed_usage_dict = (
+                    transformed_usage.model_dump()
+                    if hasattr(transformed_usage, "model_dump")
+                    else dict(transformed_usage)
                 )
-            return result.response
+                if isinstance(response, dict):
+                    response["usage"] = transformed_usage_dict
+                else:
+                    setattr(response, "usage", transformed_usage_dict)
+            return response
         else:
             return None
+
+    @staticmethod
+    def _coerce_responses_api_streaming_event_response(
+        response: Any,
+    ) -> Optional[Any]:
+        if response is None:
+            return None
+        if isinstance(response, ResponsesAPIResponse):
+            return response
+        if isinstance(response, dict):
+            try:
+                return ResponsesAPIResponse(**response)
+            except Exception:
+                return ResponsesAPIResponse.model_construct(**response)
+        return response
 
     def _handle_anthropic_messages_response_logging(self, result: Any) -> ModelResponse:
         """
@@ -3162,7 +3182,7 @@ class Logging(LiteLLMLoggingBaseClass):
             result,
             (ResponseCompletedEvent, ResponseIncompleteEvent, ResponseFailedEvent),
         ):
-            result = result.response
+            result = self._coerce_responses_api_streaming_event_response(response=getattr(result, "response", None))
         if isinstance(result, ResponsesAPIResponse):
             return self._translate_responses_api_response_to_model_response(result)
 
