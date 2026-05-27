@@ -5126,28 +5126,33 @@ class Logging(LiteLLMLoggingBaseClass):
             result,
             (ResponseCompletedEvent, ResponseIncompleteEvent, ResponseFailedEvent),
         ):
+            response: Final = Logging._coerce_responses_api_streaming_event_response(
+                response=getattr(result, "response", None)
+            )
+            if response is None:
+                return None
+
             ## return unified Usage object
-            if isinstance(result.response.usage, ResponseAPIUsage):
-                set_response_cost_in_hidden_params(
-                    result.response,
-                    provider_reported_usage_cost(
-                        result.response.usage, self.model_call_details.get("custom_llm_provider")
-                    ),
-                )
-                transformed_usage: Final = ResponseAPILoggingUtils.transform_response_api_usage_to_chat_usage(
-                    result.response.usage
-                )
+            usage: Final = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+            if isinstance(usage, ResponseAPIUsage) or (
+                isinstance(usage, dict) and ResponseAPILoggingUtils.is_response_api_usage(usage)
+            ):
+                if isinstance(response, ResponsesAPIResponse):
+                    set_response_cost_in_hidden_params(
+                        response, provider_reported_usage_cost(usage, self.model_call_details.get("custom_llm_provider"))
+                    )
+                transformed_usage: Final = ResponseAPILoggingUtils.transform_response_api_usage_to_chat_usage(usage)
                 # Set as dict instead of Usage object so model_dump() serializes it correctly
-                setattr(
-                    result.response,
-                    "usage",
-                    (
-                        transformed_usage.model_dump()
-                        if hasattr(transformed_usage, "model_dump")
-                        else dict(transformed_usage)
-                    ),
+                transformed_usage_dict: Final = (
+                    transformed_usage.model_dump()
+                    if hasattr(transformed_usage, "model_dump")
+                    else dict(transformed_usage)
                 )
-            return result.response
+                if isinstance(response, dict):
+                    response["usage"] = transformed_usage_dict
+                else:
+                    setattr(response, "usage", transformed_usage_dict)
+            return response
         elif isinstance(result, InteractionsAPIStreamingResponse):
             return self._assemble_completed_interaction_response(result)
         else:
@@ -5238,6 +5243,21 @@ class Logging(LiteLLMLoggingBaseClass):
             return logged
         return logged.model_copy(update={"id": streamed_message_id})
 
+    @staticmethod
+    def _coerce_responses_api_streaming_event_response(
+        response: object,
+    ) -> object | None:
+        if response is None:
+            return None
+        if isinstance(response, ResponsesAPIResponse):
+            return response
+        if isinstance(response, dict):
+            try:
+                return ResponsesAPIResponse(**response)
+            except Exception:
+                return ResponsesAPIResponse.model_construct(**response)
+        return response
+
     def _handle_anthropic_messages_response_logging(self, result: object) -> ModelResponse:
         """
         Handles logging for Anthropic messages responses.
@@ -5260,7 +5280,7 @@ class Logging(LiteLLMLoggingBaseClass):
             result,
             (ResponseCompletedEvent, ResponseIncompleteEvent, ResponseFailedEvent),
         ):
-            result = result.response
+            result = Logging._coerce_responses_api_streaming_event_response(response=getattr(result, "response", None))
         if isinstance(result, ResponsesAPIResponse):
             return self._translate_responses_api_response_to_model_response(result)
 
