@@ -49,7 +49,12 @@ from litellm.proxy.hooks.cache_control_check import PROXY_CacheControlCheck
 from litellm.proxy.hooks.max_iterations_limiter import PROXY_MaxIterationsHandler
 from litellm.proxy.hooks.parallel_request_limiter_v3 import PROXY_MaxParallelRequestsHandler_v3
 from litellm.proxy.utils import InternalUsageCache
-from litellm.types.llms.openai import ResponseAPIUsage, ResponseCompletedEvent, ResponsesAPIResponse
+from litellm.types.llms.openai import (
+    ResponseAPIUsage,
+    ResponseCompletedEvent,
+    ResponsesAPIResponse,
+    ResponsesAPIStreamEvents,
+)
 from litellm.types.utils import (
     CallTypes,
     ImageResponse,
@@ -4453,6 +4458,47 @@ def test_get_assembled_streaming_response_returns_none_for_non_streaming_text_co
         streaming_chunks=[],
     )
     assert assembled is None
+
+
+@pytest.mark.parametrize("usage_cost", [None, 0.0, 0.0042])
+def test_get_assembled_streaming_response_handles_responses_event_with_dict_response(usage_cost: float | None):
+    """Responses API stream events may hold response as a dict after model_construct."""
+    import datetime
+
+    logging_obj = _make_logging_obj(stream=True)
+    result = ResponseCompletedEvent.model_construct(
+        type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+        response={
+            "id": "resp-1",
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "completed",
+            "model": "gpt-5.5",
+            "usage": {
+                "input_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 21,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 41,
+                "cost": usage_cost,
+            },
+        },
+    )
+
+    assembled = logging_obj._get_assembled_streaming_response(
+        result=result,
+        start_time=datetime.datetime.now(),
+        end_time=datetime.datetime.now(),
+        is_async=True,
+        streaming_chunks=[],
+    )
+
+    assert isinstance(assembled, ResponsesAPIResponse)
+    assert assembled.usage["prompt_tokens"] == 20
+    assert assembled.usage["completion_tokens"] == 21
+    assert assembled.usage["total_tokens"] == 41
+    if usage_cost is not None:
+        assert assembled._hidden_params["additional_headers"]["llm_provider-x-litellm-response-cost"] == usage_cost
 
 
 @pytest.mark.asyncio

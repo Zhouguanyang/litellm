@@ -106,7 +106,35 @@ def _is_session_header_trace(trace_id: object, session_id: object, proxy_server_
 class _UsageObject(Protocol):
     """Token-count surface the Langfuse logger reads off a response usage payload."""
 
-    def get(self, key: Literal["cache_creation_input_tokens", "cache_read_input_tokens"], /) -> int | None: ...
+    def get(self, key: str, /) -> object | None: ...
+
+
+def _get_usage_value(usage_obj: object, key: str) -> object | None:
+    if isinstance(usage_obj, Mapping):
+        return usage_obj.get(key)
+    getter: Final = getattr(usage_obj, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            return None
+    return getattr(usage_obj, key, None)
+
+
+def _get_langfuse_token_usage(usage_obj: _UsageObject | None) -> tuple[int, int, int]:
+    chat_usage: Final = _chat_usage(usage_obj)
+    prompt_tokens_value: Final = getattr(chat_usage, "prompt_tokens", None)
+    prompt_tokens: Final = prompt_tokens_value if isinstance(prompt_tokens_value, int) else 0
+    completion_tokens_value: Final = getattr(chat_usage, "completion_tokens", None)
+    completion_tokens: Final = completion_tokens_value if isinstance(completion_tokens_value, int) else 0
+    total_tokens_value: Final = getattr(chat_usage, "total_tokens", None)
+    total_tokens: Final = (
+        total_tokens_value
+        if isinstance(total_tokens_value, int)
+        else prompt_tokens + completion_tokens
+    )
+
+    return prompt_tokens, completion_tokens, total_tokens or 0
 
 
 def _chat_usage(raw_usage: _UsageObject | None) -> _UsageObject | None:
@@ -134,9 +162,10 @@ def _extract_cache_read_input_tokens(usage_obj) -> int:
     """
     Extract cache_read_input_tokens from usage object.
 
-    Checks both:
+    Checks:
     1. Top-level cache_read_input_tokens (Anthropic format)
-    2. prompt_tokens_details.cached_tokens (Gemini, OpenAI format)
+    2. prompt_tokens_details.cached_tokens (Gemini, OpenAI chat format)
+    3. input_tokens_details.cached_tokens (Responses API and image APIs)
 
     See: https://github.com/BerriAI/litellm/issues/18520
 
@@ -146,15 +175,15 @@ def _extract_cache_read_input_tokens(usage_obj) -> int:
     Returns:
         int: Number of cached tokens read, defaults to 0
     """
-    cache_read_input_tokens = usage_obj.get("cache_read_input_tokens") or 0
+    cache_read_input_tokens = _get_usage_value(usage_obj, "cache_read_input_tokens") or 0
 
-    # Check prompt_tokens_details.cached_tokens (used by Gemini and other providers)
-    if hasattr(usage_obj, "prompt_tokens_details"):
-        prompt_tokens_details: Final[object] = getattr(usage_obj, "prompt_tokens_details", None)
-        if prompt_tokens_details is not None and hasattr(prompt_tokens_details, "cached_tokens"):
-            cached_tokens: Final = getattr(prompt_tokens_details, "cached_tokens", None)
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        token_details: Final = _get_usage_value(usage_obj, details_key)
+        if token_details is not None:
+            cached_tokens: Final = _get_usage_value(token_details, "cached_tokens")
             if cached_tokens is not None and isinstance(cached_tokens, (int, float)) and cached_tokens > 0:
                 cache_read_input_tokens = cached_tokens
+                break
 
     return cache_read_input_tokens
 
@@ -837,17 +866,12 @@ class LangFuseLogger:
             if response_obj is not None:
                 if hasattr(response_obj, "id") and response_obj.get("id", None) is not None:
                     generation_id = _logging_id(start_time, response_obj)
-                _raw_usage_obj: Final[_UsageObject | None] = getattr(response_obj, "usage", None)
-                _usage_obj: Final = _chat_usage(_raw_usage_obj)
+                _usage_obj: Final[_UsageObject | None] = getattr(response_obj, "usage", None)
 
                 if _usage_obj:
-                    # Safely get usage values, defaulting None to 0 for Langfuse compatibility.
-                    # Some providers may return null for token counts.
-                    prompt_tokens: Final = getattr(_usage_obj, "prompt_tokens", None) or 0
-                    completion_tokens: Final = getattr(_usage_obj, "completion_tokens", None) or 0
-                    total_tokens: Final = getattr(_usage_obj, "total_tokens", None) or 0
+                    prompt_tokens, completion_tokens, total_tokens = _get_langfuse_token_usage(_usage_obj)
 
-                    cache_creation_input_tokens: Final = _usage_obj.get("cache_creation_input_tokens") or 0
+                    cache_creation_input_tokens: Final = _get_usage_value(_usage_obj, "cache_creation_input_tokens") or 0
                     cache_read_input_tokens: Final = _extract_cache_read_input_tokens(_usage_obj)
 
                     usage = {
