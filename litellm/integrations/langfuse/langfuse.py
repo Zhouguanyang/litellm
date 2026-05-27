@@ -55,13 +55,42 @@ else:
     Langfuse = Any
 
 
+def _get_usage_value(usage_obj: Any, key: str) -> Any:
+    value = getattr(usage_obj, key, None)
+    if value is None and hasattr(usage_obj, "get"):
+        try:
+            value = usage_obj.get(key)
+        except Exception:
+            value = None
+    return value
+
+
+def _get_langfuse_token_usage(usage_obj: Any) -> Tuple[int, int, int]:
+    prompt_tokens = _get_usage_value(usage_obj, "prompt_tokens")
+    completion_tokens = _get_usage_value(usage_obj, "completion_tokens")
+
+    if prompt_tokens is None:
+        prompt_tokens = _get_usage_value(usage_obj, "input_tokens")
+    if completion_tokens is None:
+        completion_tokens = _get_usage_value(usage_obj, "output_tokens")
+
+    prompt_tokens = prompt_tokens or 0
+    completion_tokens = completion_tokens or 0
+    total_tokens = _get_usage_value(usage_obj, "total_tokens")
+    if total_tokens is None:
+        total_tokens = prompt_tokens + completion_tokens
+
+    return prompt_tokens, completion_tokens, total_tokens or 0
+
+
 def _extract_cache_read_input_tokens(usage_obj) -> int:
     """
     Extract cache_read_input_tokens from usage object.
 
-    Checks both:
+    Checks:
     1. Top-level cache_read_input_tokens (Anthropic format)
-    2. prompt_tokens_details.cached_tokens (Gemini, OpenAI format)
+    2. prompt_tokens_details.cached_tokens (Gemini, OpenAI chat format)
+    3. input_tokens_details.cached_tokens (Responses API and image APIs)
 
     See: https://github.com/BerriAI/litellm/issues/18520
 
@@ -71,21 +100,21 @@ def _extract_cache_read_input_tokens(usage_obj) -> int:
     Returns:
         int: Number of cached tokens read, defaults to 0
     """
-    cache_read_input_tokens = usage_obj.get("cache_read_input_tokens") or 0
+    cache_read_input_tokens = (
+        _get_usage_value(usage_obj, "cache_read_input_tokens") or 0
+    )
 
-    # Check prompt_tokens_details.cached_tokens (used by Gemini and other providers)
-    if hasattr(usage_obj, "prompt_tokens_details"):
-        prompt_tokens_details = getattr(usage_obj, "prompt_tokens_details", None)
-        if prompt_tokens_details is not None and hasattr(
-            prompt_tokens_details, "cached_tokens"
-        ):
-            cached_tokens = getattr(prompt_tokens_details, "cached_tokens", None)
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        token_details = _get_usage_value(usage_obj, details_key)
+        if token_details is not None:
+            cached_tokens = _get_usage_value(token_details, "cached_tokens")
             if (
                 cached_tokens is not None
                 and isinstance(cached_tokens, (int, float))
                 and cached_tokens > 0
             ):
                 cache_read_input_tokens = cached_tokens
+                break
 
     return cache_read_input_tokens
 
@@ -801,16 +830,12 @@ class LangFuseLogger:
                 _usage_obj = getattr(response_obj, "usage", None)
 
                 if _usage_obj:
-                    # Safely get usage values, defaulting None to 0 for Langfuse compatibility.
-                    # Some providers may return null for token counts.
-                    prompt_tokens = getattr(_usage_obj, "prompt_tokens", None) or 0
-                    completion_tokens = (
-                        getattr(_usage_obj, "completion_tokens", None) or 0
+                    prompt_tokens, completion_tokens, total_tokens = (
+                        _get_langfuse_token_usage(_usage_obj)
                     )
-                    total_tokens = getattr(_usage_obj, "total_tokens", None) or 0
 
                     cache_creation_input_tokens = (
-                        _usage_obj.get("cache_creation_input_tokens") or 0
+                        _get_usage_value(_usage_obj, "cache_creation_input_tokens") or 0
                     )
                     cache_read_input_tokens = _extract_cache_read_input_tokens(
                         _usage_obj
