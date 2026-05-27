@@ -78,6 +78,7 @@ class BaseResponsesAPIStreamingIterator:
         self._completed_response_cache_hit: Optional[bool] = None
         self._persist_completed_response_before_logging = True
         self._stream_created_time: float = time.time()
+        self._completed_output_items_by_index: Dict[int, Any] = {}
 
         # track request context for hooks
         self.litellm_metadata = litellm_metadata
@@ -104,6 +105,69 @@ class BaseResponsesAPIStreamingIterator:
         self._hidden_params["additional_headers"] = process_response_headers(
             self.response.headers or {}
         )  # GUARANTEE OPENAI HEADERS IN RESPONSE
+
+    @staticmethod
+    def _copy_stream_model(model_obj: Any) -> Optional[Any]:
+        if hasattr(model_obj, "model_dump") and hasattr(
+            type(model_obj), "model_validate"
+        ):
+            try:
+                return type(model_obj).model_validate(model_obj.model_dump())
+            except Exception:
+                return None
+        if isinstance(model_obj, dict):
+            return dict(model_obj)
+        return None
+
+    @staticmethod
+    def _dump_stream_output_item(item: Any) -> Any:
+        if hasattr(item, "model_dump"):
+            try:
+                return item.model_dump(exclude_none=True)
+            except Exception:
+                return item
+        if isinstance(item, dict):
+            return dict(item)
+        return item
+
+    def _track_completed_output_item(self, stream_event: Any) -> None:
+        if (
+            getattr(stream_event, "type", None)
+            != ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+        ):
+            return
+
+        output_index = getattr(stream_event, "output_index", None)
+        item = getattr(stream_event, "item", None)
+        if not isinstance(output_index, int) or item is None:
+            return
+
+        self._completed_output_items_by_index[output_index] = (
+            self._dump_stream_output_item(item)
+        )
+
+    def _response_event_for_logging(self, stream_event: Any) -> Any:
+        if not self._completed_output_items_by_index:
+            return stream_event
+
+        response_obj = getattr(stream_event, "response", None)
+        if response_obj is None or getattr(response_obj, "output", None):
+            return stream_event
+
+        stream_event_copy = self._copy_stream_model(stream_event)
+        if stream_event_copy is None:
+            return stream_event
+
+        response_obj_copy = getattr(stream_event_copy, "response", None)
+        if response_obj_copy is None or getattr(response_obj_copy, "output", None):
+            return stream_event_copy
+
+        output_items = [
+            self._dump_stream_output_item(item)
+            for _, item in sorted(self._completed_output_items_by_index.items())
+        ]
+        setattr(response_obj_copy, "output", output_items)
+        return stream_event_copy
 
     def _check_max_streaming_duration(self) -> None:
         """Raise litellm.Timeout if the stream has exceeded LITELLM_MAX_STREAMING_DURATION_SECONDS."""
@@ -240,13 +304,13 @@ class BaseResponsesAPIStreamingIterator:
 
                 # Store the completed response (also for incomplete/failed so logging still fires)
                 _chunk_type = getattr(openai_responses_api_chunk, "type", None)
+                self._track_completed_output_item(openai_responses_api_chunk)
                 openai_types = _get_openai_response_types()
                 if openai_responses_api_chunk and _chunk_type in (
                     openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
                     openai_types.ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE,
                     openai_types.ResponsesAPIStreamEvents.RESPONSE_FAILED,
                 ):
-                    self.completed_response = openai_responses_api_chunk
                     # Add cost to usage object if include_cost_in_streaming_usage is True
                     if (
                         litellm.include_cost_in_streaming_usage
@@ -271,6 +335,10 @@ class BaseResponsesAPIStreamingIterator:
                                 except Exception:
                                     # Best-effort usage cost annotation should not break stream replay.
                                     pass
+
+                    self.completed_response = self._response_event_for_logging(
+                        openai_responses_api_chunk
+                    )
 
                     if (
                         _chunk_type
