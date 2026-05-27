@@ -4,9 +4,12 @@ import os
 import pytest
 from litellm.integrations.langfuse.langfuse import (
     LangFuseLogger,
+    _extract_cache_read_input_tokens,
+    _get_langfuse_token_usage,
 )
 from litellm.integrations.langfuse.langfuse_handler import LangFuseHandler
 from litellm.litellm_core_utils.litellm_logging import DynamicLoggingCache
+from litellm.types.llms.openai import ResponseAPIUsage
 from unittest.mock import Mock, patch
 from litellm.types.utils import (
     StandardLoggingPayload,
@@ -285,6 +288,22 @@ def test_get_langfuse_tags():
     mock_payload["request_tags"] = []
     result = global_langfuse_logger._get_langfuse_tags(mock_payload)
     assert result == []
+
+
+def test_langfuse_token_usage_supports_responses_api_usage():
+    usage = ResponseAPIUsage(
+        input_tokens=13,
+        input_tokens_details={"cached_tokens": 3},
+        output_tokens=21,
+        total_tokens=34,
+    )
+
+    prompt_tokens, completion_tokens, total_tokens = _get_langfuse_token_usage(usage)
+
+    assert prompt_tokens == 13
+    assert completion_tokens == 21
+    assert total_tokens == 34
+    assert _extract_cache_read_input_tokens(usage) == 3
 
 
 @patch.dict(os.environ, {}, clear=True)  # Start with empty environment
