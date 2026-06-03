@@ -7006,6 +7006,18 @@ def _format_streaming_sse_chunk(chunk: Union[str, bytes]) -> Union[str, bytes]:
     return f"data: {chunk}\n\n"
 
 
+def _is_google_native_sse_stream(response: Any) -> bool:
+    response_cls = response.__class__
+    return (
+        response_cls.__module__ == "litellm.google_genai.streaming_iterator"
+        and response_cls.__name__
+        in {
+            "GoogleGenAIGenerateContentStreamingIterator",
+            "AsyncGoogleGenAIGenerateContentStreamingIterator",
+        }
+    )
+
+
 async def async_data_generator(  # noqa: PLR0915
     response, user_api_key_dict: UserAPIKeyAuth, request_data: dict
 ):
@@ -7031,6 +7043,9 @@ async def async_data_generator(  # noqa: PLR0915
         # happened to ship a streaming-iterator override (the default).
         needs_iterator_wrap = proxy_logging_obj.needs_iterator_wrap()
         needs_per_chunk_hook = proxy_logging_obj.needs_per_chunk_streaming_hook()
+        raw_sse_passthrough = bool(
+            request_data.get("_litellm_skip_openai_stream_done")
+        ) or _is_google_native_sse_stream(response)
 
         if needs_iterator_wrap:
             stream_iterator = proxy_logging_obj.async_post_call_streaming_iterator_hook(
@@ -7050,6 +7065,10 @@ async def async_data_generator(  # noqa: PLR0915
                     request_data=request_data,
                     str_so_far=_str_so_far,
                 )
+
+            if raw_sse_passthrough and isinstance(chunk, (bytes, bytearray, str)):
+                yield bytes(chunk) if isinstance(chunk, bytearray) else chunk
+                continue
 
             chunk, model_mismatch_logged = _restamp_streaming_chunk_model(
                 chunk=chunk,
@@ -7087,7 +7106,7 @@ async def async_data_generator(  # noqa: PLR0915
         if error_message is not None:
             yield error_message
         # OpenAI-compatible streams terminate with data: [DONE]; Google GenAI (?alt=sse) does not.
-        if not request_data.get("_litellm_skip_openai_stream_done"):
+        if not raw_sse_passthrough:
             done_message = "[DONE]"
             yield f"data: {done_message}\n\n"
     except Exception as e:
