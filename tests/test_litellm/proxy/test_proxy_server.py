@@ -6648,6 +6648,66 @@ async def test_async_data_generator_does_not_mark_completed_stream_as_disconnect
 
 
 @pytest.mark.asyncio
+async def test_async_data_generator_google_genai_stream_preserves_split_sse_chunks():
+    """
+    google-genai SDK streamGenerateContent?alt=sse parses complete SSE events,
+    so the proxy must not add delimiters to split network chunks.
+    """
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.proxy_server import async_data_generator
+    from litellm.proxy.utils import ProxyLogging
+
+    mock_user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
+    mock_request_data = {
+        "model": "gemini-2.0-flash",
+        "_litellm_skip_openai_stream_done": True,
+    }
+    gemini_event = (
+        b'data: {"candidates": [{"content": {"parts": [{"text": "Hello '
+        b'\\"quoted\\" text"}], "role": "model"}, "index": 0}]}\n\n'
+    )
+    split_sse_chunks = [
+        gemini_event[:2],
+        gemini_event[2:47],
+        gemini_event[47:],
+    ]
+
+    class MockStream:
+        def __aiter__(self):
+            return self._stream()
+
+        async def _stream(self):
+            for chunk in split_sse_chunks:
+                yield chunk
+
+        async def aclose(self):
+            pass
+
+    mock_response = MockStream()
+    mock_response.aclose = AsyncMock()
+    mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+    mock_proxy_logging_obj.has_streaming_callbacks.return_value = False
+    mock_proxy_logging_obj.needs_iterator_wrap.return_value = False
+    mock_proxy_logging_obj.needs_per_chunk_streaming_hook.return_value = False
+    mock_proxy_logging_obj.async_post_call_streaming_iterator_hook = MagicMock()
+    mock_proxy_logging_obj.async_post_call_streaming_hook = AsyncMock()
+    mock_proxy_logging_obj.post_call_failure_hook = AsyncMock()
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj", mock_proxy_logging_obj):
+        with patch.object(ProxyLogging, "_fire_deferred_stream_logging"):
+            yielded_data = []
+            async for data in async_data_generator(
+                mock_response, mock_user_api_key_dict, mock_request_data
+            ):
+                yielded_data.append(data)
+
+    assert yielded_data == split_sse_chunks
+    assert all(b"[DONE]" not in chunk for chunk in yielded_data)
+    assert not yielded_data[0].endswith(b"\n\n")
+    assert b"".join(yielded_data) == gemini_event
+
+
+@pytest.mark.asyncio
 async def test_async_data_generator_google_genai_stream_forwards_error_without_done():
     """Stream errors must still reach the client when OpenAI [DONE] is skipped."""
     from litellm.proxy._types import UserAPIKeyAuth
