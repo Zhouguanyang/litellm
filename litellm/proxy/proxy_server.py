@@ -10325,6 +10325,14 @@ def _format_streaming_sse_chunk(chunk: object) -> str | bytes:
     return f"data: {chunk}\n\n"
 
 
+def _is_google_native_sse_stream(response: Any) -> bool:
+    response_cls: Final = response.__class__
+    return response_cls.__module__ == "litellm.google_genai.streaming_iterator" and response_cls.__name__ in {
+        "GoogleGenAIGenerateContentStreamingIterator",
+        "AsyncGoogleGenAIGenerateContentStreamingIterator",
+    }
+
+
 _SSE_FRAME_DELIMITERS: Final = ("\r\n\r\n", "\n\n", "\r\r")
 _OPENAI_STREAM_DONE_FRAME: Final = "data: [DONE]\n\n"
 _MAX_RAW_SSE_BUFFER_CHARS: Final = 8 * 1024 * 1024
@@ -10564,7 +10572,9 @@ async def async_data_generator(
     stream_completed = False
     client_disconnected = False
     error_state: Final = ResponsesStreamErrorState() if responses_stream_errors else None
-    ends_with_openai_done: Final = not request_data.get("_litellm_skip_openai_stream_done")
+    ends_with_openai_done: Final = not (
+        request_data.get("_litellm_skip_openai_stream_done") or _is_google_native_sse_stream(response)
+    )
     needs_iterator_wrap: Final = proxy_logging_obj.needs_iterator_wrap()
     stream_iterator: Final = _object_stream(
         proxy_logging_obj.async_post_call_streaming_iterator_hook(
@@ -10604,6 +10614,7 @@ async def async_data_generator(
         needs_per_chunk_hook: Final = proxy_logging_obj.needs_per_chunk_streaming_hook()
         is_raw_sse_stream: Final = bool(request_data.get("_litellm_raw_sse_stream"))
         strip_stream_usage: Final = bool(request_data.get("_litellm_strip_stream_usage"))
+        raw_sse_passthrough: Final = not ends_with_openai_done and not is_raw_sse_stream
         raw_sse_buffer = ""
 
         # A stream can start on a deployment with keepalive off and fall back
@@ -10667,6 +10678,16 @@ async def async_data_generator(
                 and fallback_errors
                 and not fallback_metadata_event_sent
             )
+
+            if raw_sse_passthrough and isinstance(chunk, (bytes, bytearray, str)):
+                yield bytes(chunk) if isinstance(chunk, bytearray) else chunk
+                if pending_fallback_event:
+                    yield _format_fallback_metadata_sse_event(
+                        fallback_model=fallback_model_from_metadata,
+                        fallback_errors=fallback_errors,
+                    )
+                    fallback_metadata_event_sent = True
+                continue
 
             chunk, model_mismatch_logged = _restamp_streaming_chunk_model(
                 chunk=chunk,
