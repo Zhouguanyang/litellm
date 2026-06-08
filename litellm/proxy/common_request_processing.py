@@ -577,6 +577,13 @@ def _override_openai_response_model(
         return
 
     if isinstance(response_obj, dict):
+        if "model" not in response_obj:
+            verbose_proxy_logger.debug(
+                "%s: response has no model field; skipping response model override. response_type=%s",
+                log_context,
+                type(response_obj),
+            )
+            return
         downstream_model = response_obj.get("model")
         if downstream_model != requested_model:
             verbose_proxy_logger.debug(
@@ -589,8 +596,8 @@ def _override_openai_response_model(
         return
 
     if not hasattr(response_obj, "model"):
-        verbose_proxy_logger.error(
-            "%s: cannot override response model; missing `model` attribute. response_type=%s",
+        verbose_proxy_logger.debug(
+            "%s: response has no model attribute; skipping response model override. response_type=%s",
             log_context,
             type(response_obj),
         )
