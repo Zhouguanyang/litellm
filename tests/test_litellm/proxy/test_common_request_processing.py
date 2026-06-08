@@ -13,6 +13,7 @@ import litellm
 from litellm._uuid import uuid
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.opentelemetry import UserAPIKeyAuth
+from litellm.proxy import common_request_processing as common_request_processing_module
 from litellm.proxy.common_request_processing import (
     ProxyBaseLLMRequestProcessing,
     ProxyConfig,
@@ -32,6 +33,102 @@ from litellm.proxy.utils import ProxyLogging
 
 
 class TestProxyBaseLLMRequestProcessing:
+    async def _process_mocked_llm_response(
+        self,
+        monkeypatch,
+        response,
+        route_type,
+        requested_model,
+    ):
+        async def fake_llm_call():
+            return response
+
+        async def fake_route_request(**kwargs):
+            return fake_llm_call()
+
+        monkeypatch.setattr(
+            common_request_processing_module,
+            "route_request",
+            fake_route_request,
+        )
+
+        logging_obj = MagicMock()
+        logging_obj.litellm_call_id = "test-call-id"
+        logging_obj._enqueue_deferred_logging = None
+        logging_obj._on_deferred_stream_complete = None
+        logging_obj.cost_breakdown = None
+
+        proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        proxy_logging_obj.during_call_hook = AsyncMock(return_value={})
+        proxy_logging_obj.update_request_status = AsyncMock()
+        proxy_logging_obj.post_call_success_hook = AsyncMock(return_value=response)
+        proxy_logging_obj.post_call_response_headers_hook = AsyncMock(return_value={})
+
+        user_api_key_dict = MagicMock()
+        user_api_key_dict.spend = 0
+        user_api_key_dict.tpm_limit = None
+        user_api_key_dict.rpm_limit = None
+        user_api_key_dict.max_budget = None
+        user_api_key_dict.allowed_model_region = None
+
+        processor = ProxyBaseLLMRequestProcessing(
+            data={
+                "model": requested_model,
+                "litellm_logging_obj": logging_obj,
+            }
+        )
+
+        return await processor.base_process_llm_request(
+            request=Request({"type": "http", "headers": []}),
+            fastapi_response=Response(),
+            user_api_key_dict=user_api_key_dict,
+            route_type=route_type,
+            proxy_logging_obj=proxy_logging_obj,
+            general_settings={},
+            proxy_config=MagicMock(spec=ProxyConfig),
+            skip_pre_call_logic=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_google_generate_content_does_not_add_response_model(
+        self, monkeypatch
+    ):
+        from litellm.types.google_genai.main import GenerateContentResponse
+
+        response = GenerateContentResponse(candidates=[])
+
+        result = await self._process_mocked_llm_response(
+            monkeypatch=monkeypatch,
+            response=response,
+            route_type="agenerate_content",
+            requested_model="gemini/gemini-2.5-flash",
+        )
+
+        assert result is response
+        assert not hasattr(result, "model")
+
+    @pytest.mark.asyncio
+    async def test_video_generation_restamps_response_model(self, monkeypatch):
+        from litellm.types.videos.main import VideoObject
+
+        response = VideoObject(
+            id="video_123",
+            object="video",
+            status="processing",
+            model="internal-video-model",
+        )
+
+        result = await self._process_mocked_llm_response(
+            monkeypatch=monkeypatch,
+            response=response,
+            route_type="avideo_generation",
+            requested_model="public-video-model",
+        )
+
+        assert result is response
+        assert result.model == "public-video-model"
+
+
     @pytest.mark.asyncio
     async def test_base_passthrough_process_llm_request_preserves_litellm_headers_for_non_streaming_response(
         self, monkeypatch
@@ -1671,6 +1768,34 @@ class TestExtractErrorFromSSEChunk:
 
 class TestOverrideOpenAIResponseModel:
     """Tests for _override_openai_response_model function"""
+
+    def test_override_model_skips_object_without_model_attribute_without_error(
+        self, caplog
+    ):
+        from litellm.types.google_genai.main import GenerateContentResponse
+
+        response_obj = GenerateContentResponse(candidates=[])
+
+        with caplog.at_level("ERROR"):
+            _override_openai_response_model(
+                response_obj=response_obj,
+                requested_model="gemini/gemini-2.5-flash",
+                log_context="test_context",
+            )
+
+        assert not hasattr(response_obj, "model")
+        assert "cannot override response model" not in caplog.text
+
+    def test_override_model_skips_dict_without_model_field(self):
+        response_obj = {"candidates": []}
+
+        _override_openai_response_model(
+            response_obj=response_obj,
+            requested_model="gemini/gemini-2.5-flash",
+            log_context="test_context",
+        )
+
+        assert response_obj == {"candidates": []}
 
     def test_override_model_preserves_fallback_model_when_fallback_occurred_object(
         self,
