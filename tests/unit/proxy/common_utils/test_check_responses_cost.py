@@ -1880,6 +1880,33 @@ def _proxy_config_with(default_team_settings: tuple[Mapping[str, object], ...]):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_price", (0.0, 0.02))
+async def test_background_settlement_uses_configured_request_price(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch, request_price: float,
+) -> None:
+    import litellm
+
+    model: Final = "openai/unit-background-request-price"
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "responses",
+        "input_cost_per_token": 0.001, "output_cost_per_token": 0.002,
+    }})
+    capture: Final = _spend_capture_logger()
+    monkeypatch.setattr(litellm, "_async_success_callback", [capture])
+    read: Final = _terminal_response()
+    read.hidden_params = {"response_cost": 0.0}
+    billing: Final = await _bill_through_a_priced_deployment(
+        read, litellm_params={"model": model, "api_key": "unused"},
+        model_info={"output_cost_per_request": request_price},
+    )
+    (payload,) = capture.payloads
+    assert billing.cost == pytest.approx(request_price)
+    assert payload["response_cost"] == pytest.approx(request_price)
+    assert billing.table.statuses == {"job-priced": "completed"}
+    assert read.hidden_params == {"response_cost": 0.0}
+
+
+@pytest.mark.asyncio
 async def test_the_billing_event_prices_the_fetched_usage_at_the_deployment_rates(monkeypatch: pytest.MonkeyPatch):
     """Billing logs the body the read already fetched instead of reading it again, so the event must
     carry the deployment's own pricing (100 input tokens at 0.001 plus 50 output tokens at 0.002 is

@@ -10431,6 +10431,28 @@ async def test_common_checks_allows_priced_model_when_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("request_price", (None, 0.0, 0.02))
+async def test_common_checks_recognizes_configured_request_prices(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch, request_price: float | None,
+) -> None:
+    monkeypatch.setattr(litellm, "block_requests_for_models_without_pricing", True)
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "request-priced", "litellm_params": {
+            "model": "openai/unit-outside-catalog-request-price", "api_key": "unused",
+        },
+        "model_info": {
+            "id": "unit-outside-catalog-request-price-id",
+            **({"output_cost_per_request": request_price} if request_price is not None else {}),
+        },
+    }])
+    if request_price is None:
+        with pytest.raises(ProxyException, match="no pricing"):
+            await _run_common_checks(model="request-priced", llm_router=router)
+        return
+    assert await _run_common_checks(model="request-priced", llm_router=router) is True
+
+
+@pytest.mark.asyncio
 async def test_common_checks_ignores_non_llm_route_when_enabled(monkeypatch):
     monkeypatch.setattr(litellm, "block_requests_for_models_without_pricing", True)
     router = _router_with_priced_and_unpriced_models()

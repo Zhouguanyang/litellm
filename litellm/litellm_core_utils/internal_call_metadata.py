@@ -20,13 +20,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final
+from urllib.parse import urlsplit
+
+from pydantic import TypeAdapter, ValidationError
 
 from litellm.constants import (
+    GENERIC_PASSTHROUGH_CALL_TYPES,
     INTERNAL_CALL_ORIGIN_METADATA_KEY,
     MANAGED_BACKGROUND_RESPONSE_METADATA_KEY,
     NON_INFERENCE_CALL_TYPES,
+    PENDING_RESPONSE_STATUSES,
 )
-from litellm.litellm_core_utils.core_helpers import as_str_mapping
+from litellm.litellm_core_utils.core_helpers import as_str_mapping, attribute_or_none
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import initialize_standard_callback_dynamic_params
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     SETTLES_BACKGROUND_RESPONSE_KWARG,
@@ -103,6 +108,38 @@ def requests_background(request_body: Mapping[str, object]) -> bool:
 
 
 _RESPONSE_CREATE_CALL_TYPES: Final = frozenset({"responses", "aresponses"})
+_TOKEN_COUNTING_SEGMENTS: Final = frozenset({"count_tokens", "count-tokens", "input_tokens", "token_counter"})
+_PASSTHROUGH_JSON: Final = TypeAdapter(object)
+
+
+def is_token_counting_route(route: str) -> bool:
+    resource, _, action = urlsplit(route).path.rstrip("/").rsplit("/", 1)[-1].partition(":")
+    return (
+        action == "countTokens"
+        or (not action and resource in _TOKEN_COUNTING_SEGMENTS)
+        or (resource == "count-tokens" and action == "rawPredict")
+    )
+
+
+def passthrough_request_routes(call_details: object) -> tuple[str, ...]:
+    details: Final = as_str_mapping(call_details)
+    if details is None:
+        return ()
+    payload: Final = as_str_mapping(details.get("passthrough_logging_payload"))
+    params: Final = as_str_mapping(details.get("litellm_params"))
+    proxy_request: Final = as_str_mapping(params.get("proxy_server_request")) if params is not None else None
+    routes: Final = (
+        payload.get("url") if payload is not None else None,
+        proxy_request.get("url") if proxy_request is not None else None,
+        details.get("endpoint"),
+    )
+    return tuple(route for route in routes if isinstance(route, str))
+
+
+def is_token_counting_passthrough(call_type: str | None, call_details: object) -> bool:
+    if call_type not in GENERIC_PASSTHROUGH_CALL_TYPES:
+        return False
+    return any(is_token_counting_route(route) for route in passthrough_request_routes(call_details))
 
 
 def _finished_response(response: object) -> object:
@@ -110,7 +147,37 @@ def _finished_response(response: object) -> object:
     return response if wrapped is None else wrapped
 
 
+def passthrough_response_payload(response: object) -> object:
+    finished: Final = _finished_response(response)
+    if not isinstance(finished, str):
+        return finished
+    try:
+        return _PASSTHROUGH_JSON.validate_json(finished)
+    except ValidationError:
+        return finished
+
+
+def is_pending_background_response(response: object) -> bool:
+    finished: Final = passthrough_response_payload(response)
+    if not is_background_response(finished):
+        return False
+    mapping: Final = as_str_mapping(finished)
+    status: Final[object] = mapping.get("status") if mapping is not None else getattr(finished, "status", None)
+    return status in PENDING_RESPONSE_STATUSES
+
+
+def is_passthrough_batch_management_call(call_type: str | None, response: object) -> bool:
+    if call_type not in GENERIC_PASSTHROUGH_CALL_TYPES:
+        return False
+    payload: Final = passthrough_response_payload(response)
+    mapping: Final = as_str_mapping(payload)
+    object_type: Final = mapping.get("object") if mapping is not None else attribute_or_none(payload, "object")
+    return object_type in ("batch", "batch_prediction_job")
+
+
 def _may_be_unbilled(call_type: str | None, response: object) -> bool:
+    if is_passthrough_batch_management_call(call_type, response):
+        return True
     if call_type in _RESPONSE_CREATE_CALL_TYPES:
         return is_background_response(_finished_response(response))
     return call_type in NON_INFERENCE_CALL_TYPES

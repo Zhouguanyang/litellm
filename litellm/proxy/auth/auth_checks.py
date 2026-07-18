@@ -743,7 +743,7 @@ def _is_cost_explicitly_configured(deployments: Sequence[DeploymentTypedDict]) -
 
 
 def _has_explicit_positive_cost(deployments: Sequence[DeploymentTypedDict]) -> bool:
-    """Whether any of the deployments carries an explicit positive per-token or per-query price.
+    """Whether any of the deployments carries an explicit positive price.
 
     The group's price is read from the deployments named after the routed group and from
     that group's own alias target, while an alias chain is served from the deployments named
@@ -756,7 +756,8 @@ def _has_explicit_positive_cost(deployments: Sequence[DeploymentTypedDict]) -> b
             continue
         raw_entry = as_str_mapping(litellm.model_cost.get(model_id)) or _EMPTY_COST_ENTRY
         if (
-            _is_positive_cost(raw_entry.get("input_cost_per_token"))
+            _is_positive_cost(raw_entry.get("output_cost_per_request"))
+            or _is_positive_cost(raw_entry.get("input_cost_per_token"))
             or _is_positive_cost(raw_entry.get("output_cost_per_token"))
             or _is_positive_cost(_deployment_query_price(deployment["litellm_params"], raw_entry))
         ):
@@ -811,7 +812,9 @@ def _model_group_has_pricing(model: str, llm_router: "Router") -> bool:
             continue
 
         model_info = registry.deployment_model_info(model_id, litellm_params.get("model") or "")
-        if model_info is not None and _entry_has_priced_metric(model_info):
+        if model_info is not None and (
+            model_info.get("output_cost_per_request") is not None or _entry_has_priced_metric(model_info)
+        ):
             return True
 
     return False
