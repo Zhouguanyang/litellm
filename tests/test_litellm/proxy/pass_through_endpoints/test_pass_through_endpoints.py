@@ -1176,6 +1176,59 @@ async def test_create_pass_through_route_forwards_timeout():
         assert call_kwargs["timeout"] == 1800
 
 
+@pytest.mark.asyncio
+async def test_create_pass_through_route_forwards_registered_custom_llm_provider():
+    unique_path = "/v1beta/models/gemini-3.1-flash-image:generateContent"
+    endpoint_func = create_pass_through_route(
+        endpoint="/v1beta",
+        target="https://generativelanguage.googleapis.com",
+        custom_headers={},
+        _forward_headers=True,
+        _merge_query_params=False,
+        dependencies=[],
+    )
+
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_request"
+        ) as mock_pass_through,
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.is_registered_pass_through_route"
+        ) as mock_is_registered,
+        patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.InitPassThroughEndpointHelpers.get_registered_pass_through_route"
+        ) as mock_get_registered,
+    ):
+        mock_pass_through.return_value = MagicMock()
+        mock_is_registered.return_value = True
+        mock_get_registered.return_value = {
+            "passthrough_params": {
+                "custom_llm_provider": "gemini",
+            }
+        }
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = MagicMock()
+        mock_request.url.path = unique_path
+        mock_request.state = SimpleNamespace()
+        mock_request.path_params = {}
+        mock_request.headers = Headers({})
+        mock_request.query_params = QueryParams({})
+
+        mock_user_api_key_dict = MagicMock()
+        mock_user_api_key_dict.api_key = "test-key"
+
+        await endpoint_func(
+            request=mock_request,
+            user_api_key_dict=mock_user_api_key_dict,
+            fastapi_response=MagicMock(),
+        )
+
+        call_kwargs = mock_pass_through.call_args[1]
+        assert call_kwargs["custom_llm_provider"] == "gemini"
+
+
 def test_initialize_pass_through_endpoints_with_cost_per_request():
     """
     Test that initialize_pass_through_endpoints correctly passes cost_per_request to route creation
@@ -1233,6 +1286,35 @@ def test_initialize_pass_through_endpoints_with_cost_per_request():
     # Verify the wildcard path and endpoint function
     assert call_args["path"] == "/test/path/{subpath:path}"
     assert callable(call_args["endpoint"])
+
+
+def test_add_subpath_route_registers_custom_llm_provider():
+    path = "/v1beta"
+    endpoint_id = "gemini-passthrough-provider-test"
+    mock_app = MagicMock()
+
+    try:
+        InitPassThroughEndpointHelpers.add_subpath_route(
+            app=mock_app,
+            path=path,
+            target="https://generativelanguage.googleapis.com",
+            custom_headers={},
+            forward_headers=True,
+            merge_query_params=False,
+            dependencies=[],
+            cost_per_request=None,
+            endpoint_id=endpoint_id,
+            custom_llm_provider="gemini",
+        )
+
+        route_info = InitPassThroughEndpointHelpers.get_registered_pass_through_route(
+            route="/v1beta/models/gemini-3.1-flash-image:generateContent",
+            method="POST",
+        )
+        assert route_info is not None
+        assert route_info["passthrough_params"]["custom_llm_provider"] == "gemini"
+    finally:
+        InitPassThroughEndpointHelpers.remove_endpoint_routes(endpoint_id)
 
 
 @pytest.mark.asyncio

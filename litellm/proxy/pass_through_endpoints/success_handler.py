@@ -412,7 +412,13 @@ class PassThroughEndpointLogging:
     def is_gemini_route(self, url_route: str, custom_llm_provider: str | None = None):
         """Check if the URL route is a Gemini API route."""
         for route in self.TRACKED_GEMINI_ROUTES:
-            if route in url_route and custom_llm_provider == "gemini":
+            if route not in url_route:
+                continue
+            if custom_llm_provider == "gemini":
+                return True
+            parsed_url = urlparse(url_route)
+            path = parsed_url.path if parsed_url.scheme else url_route
+            if path.startswith(("/v1beta/models/", "/v1/models/")):
                 return True
         return False
 

@@ -254,9 +254,11 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     output_cost_per_token_above_272k_tokens_flex: float | None
     output_cost_per_token_above_512k_tokens: float | None  # MiniMax-M3: prompts >512K priced at 2x output
     output_cost_per_character_above_128k_tokens: float | None  # only for vertex ai models
+    output_cost_per_request: float | None
     output_cost_per_image: float | None
     output_cost_per_image_token: float | None
     output_cost_per_video_token: float | None  # for gemini omni models with video output
+    force_output_cost_per_image: bool | None
     output_vector_size: int | None
     output_cost_per_reasoning_token: float | None
     output_cost_per_reasoning_token_flex: float | None
@@ -3320,9 +3322,11 @@ class CustomPricingLiteLLMParams(MirroredPricingParams):
     output_cost_per_token_above_272k_tokens_priority: float | None = None
     output_cost_per_token_above_272k_tokens_flex: float | None = None
     output_cost_per_character_above_128k_tokens: float | None = None
+    output_cost_per_request: float | None = None
     output_cost_per_image: float | None = None
     output_cost_per_image_token: float | None = None
     output_cost_per_video_token: float | None = None
+    force_output_cost_per_image: bool | None = None
     output_cost_per_reasoning_token: float | None = None
     output_cost_per_reasoning_token_flex: float | None = None
     output_cost_per_reasoning_token_priority: float | None = None
