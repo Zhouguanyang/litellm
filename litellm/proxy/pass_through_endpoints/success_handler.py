@@ -615,12 +615,18 @@ class PassThroughEndpointLogging:
 
     def is_gemini_route(self, url_route: str, custom_llm_provider: str | None = None):
         """Check if the URL route is a Gemini API route."""
-        if custom_llm_provider != "gemini":
+        if custom_llm_provider not in (None, "gemini"):
             return False
         if VertexPassthroughLoggingHandler.is_interactions_route(url_route):
-            return True
+            return custom_llm_provider == "gemini"
         for route in self.TRACKED_GEMINI_ROUTES:
-            if route in url_route:
+            if route not in url_route:
+                continue
+            if custom_llm_provider == "gemini":
+                return True
+            parsed_url: Final = urlparse(url_route)
+            path: Final = parsed_url.path if parsed_url.scheme else url_route
+            if path.startswith(("/v1beta/models/", "/v1/models/")):
                 return True
         return False
 
