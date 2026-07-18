@@ -207,6 +207,130 @@ class GeminiPassthroughLoggingHandler:
         return "unknown"
 
     @staticmethod
+    def _count_generated_images(
+        litellm_model_response: Union[ModelResponse, TextCompletionResponse],
+    ) -> int:
+        image_count = 0
+        choices = getattr(litellm_model_response, "choices", None) or []
+        for choice in choices:
+            message = getattr(choice, "message", None)
+            if message is None and isinstance(choice, dict):
+                message = choice.get("message")
+            if message is None:
+                continue
+            images = message.get("images") if isinstance(message, dict) else getattr(message, "images", None)
+            if isinstance(images, list):
+                image_count += len(images)
+        return image_count
+
+    @staticmethod
+    def _strip_provider_prefix(model: Optional[str]) -> Optional[str]:
+        if not isinstance(model, str):
+            return None
+        if "/" not in model:
+            return model
+        return model.split("/", 1)[1]
+
+    @staticmethod
+    def _is_forced_flat_pricing_model_info(model_info: object) -> bool:
+        return isinstance(model_info, dict) and (
+            model_info.get("output_cost_per_request") is not None
+            or bool(model_info.get("force_output_cost_per_image"))
+        )
+
+    @staticmethod
+    def _get_forced_flat_pricing_model_info_from_deployment(
+        deployment: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        model_info = deployment.get("model_info")
+        if GeminiPassthroughLoggingHandler._is_forced_flat_pricing_model_info(model_info):
+            return model_info
+
+        if isinstance(model_info, dict):
+            model_id = model_info.get("id")
+            registered_model_info = litellm.model_cost.get(model_id) if isinstance(model_id, str) else None
+            if GeminiPassthroughLoggingHandler._is_forced_flat_pricing_model_info(registered_model_info):
+                return registered_model_info
+
+        litellm_params = deployment.get("litellm_params")
+        if GeminiPassthroughLoggingHandler._is_forced_flat_pricing_model_info(litellm_params):
+            return litellm_params
+
+        return None
+
+    @staticmethod
+    def _get_model_info_from_router(model: str) -> Optional[Dict[str, Any]]:
+        try:
+            from litellm.proxy.proxy_server import llm_model_list, llm_router
+        except Exception:
+            return None
+        deployments = []
+        if llm_router is not None:
+            deployments.extend(getattr(llm_router, "model_list", []) or [])
+        deployments.extend(llm_model_list or [])
+        if not deployments:
+            return None
+
+        for deployment in deployments:
+            if not isinstance(deployment, dict):
+                continue
+            litellm_params = deployment.get("litellm_params", {}) or {}
+            litellm_model = litellm_params.get("model")
+            if model not in (
+                deployment.get("model_name"),
+                litellm_model,
+                GeminiPassthroughLoggingHandler._strip_provider_prefix(litellm_model),
+            ):
+                continue
+            model_info = GeminiPassthroughLoggingHandler._get_forced_flat_pricing_model_info_from_deployment(
+                deployment=deployment
+            )
+            if model_info is not None:
+                return model_info
+        return None
+
+    @staticmethod
+    def _get_forced_flat_pricing_model_info(
+        model: str,
+    ) -> Optional[Dict[str, Any]]:
+        router_model_info = GeminiPassthroughLoggingHandler._get_model_info_from_router(model=model)
+        if router_model_info is not None:
+            return router_model_info
+
+        try:
+            model_info = litellm.get_model_info(model=model, custom_llm_provider="gemini")
+        except Exception:
+            return None
+
+        if GeminiPassthroughLoggingHandler._is_forced_flat_pricing_model_info(model_info):
+            return model_info
+        return None
+
+    @staticmethod
+    def _get_forced_flat_pricing_cost(
+        litellm_model_response: Union[ModelResponse, TextCompletionResponse],
+        model: str,
+    ) -> Optional[float]:
+        model_info = GeminiPassthroughLoggingHandler._get_forced_flat_pricing_model_info(
+            model=model,
+        )
+        if model_info is None:
+            return None
+
+        output_cost_per_request = model_info.get("output_cost_per_request")
+        if output_cost_per_request is not None:
+            return float(output_cost_per_request)
+
+        image_count = GeminiPassthroughLoggingHandler._count_generated_images(
+            litellm_model_response=litellm_model_response,
+        )
+        if image_count == 0:
+            return None
+
+        output_cost_per_image: float = model_info.get("output_cost_per_image") or 0.0
+        return output_cost_per_image * image_count
+
+    @staticmethod
     def _create_gemini_response_logging_payload_for_generate_content(
         litellm_model_response: Union[ModelResponse, TextCompletionResponse],
         model: str,
@@ -220,11 +344,16 @@ class GeminiPassthroughLoggingHandler:
         Create the standard logging object for Gemini passthrough generateContent (streaming and non-streaming)
         """
 
-        response_cost = litellm.completion_cost(
-            completion_response=litellm_model_response,
+        response_cost = GeminiPassthroughLoggingHandler._get_forced_flat_pricing_cost(
+            litellm_model_response=litellm_model_response,
             model=model,
-            custom_llm_provider="gemini",
         )
+        if response_cost is None:
+            response_cost = litellm.completion_cost(
+                completion_response=litellm_model_response,
+                model=model,
+                custom_llm_provider="gemini",
+            )
 
         kwargs["response_cost"] = response_cost
         kwargs["model"] = model
