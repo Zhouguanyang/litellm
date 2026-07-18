@@ -33,6 +33,11 @@ def cost_calculator(
         model_info=_model_info,
     )
 
+    if _model_info.get("force_output_cost_per_image"):
+        output_cost_per_image: Final[float] = _model_info.get("output_cost_per_image") or 0.0
+        num_images: Final[int] = len(image_response.data) if image_response.data else 0
+        return output_cost_per_image * num_images + web_search_cost
+
     token_based_cost: Final = calculate_image_response_cost_from_usage(
         model=model,
         image_response=image_response,
