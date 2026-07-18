@@ -41,6 +41,37 @@ def test_cost_per_token_duplicate_openai_prefix_matches_model_cost(monkeypatch):
     assert prompt_usd + completion_usd > 0
 
 
+def test_cost_per_token_output_cost_per_request_overrides_tokens(monkeypatch):
+    fixed_model = "gemini/gemini-fixed-request-test"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            **litellm.model_cost,
+            fixed_model: {
+                "input_cost_per_token": 1.0,
+                "litellm_provider": "gemini",
+                "max_input_tokens": 4096,
+                "max_output_tokens": 4096,
+                "max_tokens": 4096,
+                "mode": "chat",
+                "output_cost_per_request": 0.017,
+                "output_cost_per_token": 1.0,
+            },
+        },
+    )
+
+    prompt_usd, completion_usd = cost_per_token(
+        model="gemini-fixed-request-test",
+        prompt_tokens=3279,
+        completion_tokens=1423,
+        custom_llm_provider="gemini",
+    )
+
+    assert prompt_usd == 0.0
+    assert completion_usd == pytest.approx(0.017)
+
+
 def test_cost_per_token_non_string_model_does_not_hang():
     """
     The provider-prefix dedup loop must not spin forever when `model` is a

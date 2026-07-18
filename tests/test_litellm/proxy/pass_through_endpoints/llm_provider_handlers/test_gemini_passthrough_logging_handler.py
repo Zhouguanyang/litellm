@@ -5,6 +5,7 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import litellm
 import pytest
 
 sys.path.insert(
@@ -18,9 +19,14 @@ from litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrou
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    PassThroughStreamingHandler,
+)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    EndpointType,
     PassthroughStandardLoggingPayload,
 )
+from litellm.types.utils import ModelResponse
 
 
 class TestGeminiPassthroughLoggingHandler:
@@ -240,6 +246,250 @@ class TestGeminiPassthroughLoggingHandler:
         # Verify cost calculation was called
         mock_completion_cost.assert_called_once()
 
+    @patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers."
+        "gemini_passthrough_logging_handler.litellm.get_model_info"
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers."
+        "gemini_passthrough_logging_handler.litellm.completion_cost"
+    )
+    def test_gemini_passthrough_generate_content_can_force_flat_image_pricing(
+        self,
+        mock_completion_cost,
+        mock_get_model_info,
+    ):
+        mock_get_model_info.return_value = {
+            "force_output_cost_per_image": True,
+            "output_cost_per_image": 0.017,
+        }
+        litellm_model_response = ModelResponse(
+            choices=[
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "images": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,img1",
+                                    "detail": "auto",
+                                },
+                                "index": 0,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,img2",
+                                    "detail": "auto",
+                                },
+                                "index": 1,
+                            },
+                        ],
+                    }
+                }
+            ]
+        )
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        kwargs = GeminiPassthroughLoggingHandler._create_gemini_response_logging_payload_for_generate_content(
+            litellm_model_response=litellm_model_response,
+            model="gemini-3.1-flash-image",
+            kwargs={},
+            start_time=self.start_time,
+            end_time=self.end_time,
+            logging_obj=mock_logging_obj,
+            custom_llm_provider="gemini",
+        )
+
+        assert kwargs["response_cost"] == pytest.approx(0.034)
+        assert mock_logging_obj.model_call_details["response_cost"] == pytest.approx(0.034)
+        mock_completion_cost.assert_not_called()
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers."
+        "gemini_passthrough_logging_handler.litellm.get_model_info"
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers."
+        "gemini_passthrough_logging_handler.litellm.completion_cost"
+    )
+    def test_gemini_passthrough_generate_content_can_force_flat_request_pricing_for_text(
+        self,
+        mock_completion_cost,
+        mock_get_model_info,
+    ):
+        mock_get_model_info.return_value = {
+            "output_cost_per_request": 0.017,
+        }
+        litellm_model_response = ModelResponse(
+            choices=[
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                    }
+                }
+            ]
+        )
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        kwargs = GeminiPassthroughLoggingHandler._create_gemini_response_logging_payload_for_generate_content(
+            litellm_model_response=litellm_model_response,
+            model="gemini-3.1-flash-image",
+            kwargs={},
+            start_time=self.start_time,
+            end_time=self.end_time,
+            logging_obj=mock_logging_obj,
+            custom_llm_provider="gemini",
+        )
+
+        assert kwargs["response_cost"] == pytest.approx(0.017)
+        assert mock_logging_obj.model_call_details["response_cost"] == pytest.approx(0.017)
+        mock_completion_cost.assert_not_called()
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers."
+        "gemini_passthrough_logging_handler.litellm.completion_cost"
+    )
+    def test_gemini_passthrough_reads_flat_request_pricing_from_registered_deployment(
+        self,
+        mock_completion_cost,
+    ):
+        router = MagicMock()
+        router.model_list = [
+            {
+                "model_name": "gemini-3.1-flash-image",
+                "litellm_params": {"model": "gemini/gemini-3.1-flash-image"},
+                "model_info": {"id": "deployment-id"},
+            }
+        ]
+        litellm_model_response = ModelResponse(
+            choices=[
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                    }
+                }
+            ]
+        )
+        mock_logging_obj = self._create_mock_logging_obj()
+
+        with (
+            patch("litellm.proxy.proxy_server.llm_router", router),
+            patch.dict(
+                litellm.model_cost,
+                {"deployment-id": {"output_cost_per_request": 0.017}},
+            ),
+        ):
+            kwargs = GeminiPassthroughLoggingHandler._create_gemini_response_logging_payload_for_generate_content(
+                litellm_model_response=litellm_model_response,
+                model="gemini-3.1-flash-image",
+                kwargs={},
+                start_time=self.start_time,
+                end_time=self.end_time,
+                logging_obj=mock_logging_obj,
+                custom_llm_provider="gemini",
+            )
+
+        assert kwargs["response_cost"] == pytest.approx(0.017)
+        assert mock_logging_obj.model_call_details["response_cost"] == pytest.approx(0.017)
+        mock_completion_cost.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler."
+        "VertexPassthroughLoggingHandler._handle_logging_vertex_collected_chunks"
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrough_logging_handler."
+        "litellm.completion_cost"
+    )
+    async def test_gemini_passthrough_streaming_dispatch_preserves_flat_request_pricing(
+        self,
+        mock_completion_cost,
+        mock_vertex_handler,
+    ):
+        router = MagicMock()
+        router.model_list = [
+            {
+                "model_name": "gemini-3.1-flash-image",
+                "litellm_params": {"model": "gemini/gemini-3.1-flash-image"},
+                "model_info": {
+                    "output_cost_per_request": 0.017,
+                },
+            }
+        ]
+        url_route = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-3.1-flash-image:streamGenerateContent?alt=sse"
+        )
+        logging_obj = LiteLLMLoggingObj(
+            model="gemini-3.1-flash-image",
+            messages=[{"role": "user", "content": "draw"}],
+            stream=True,
+            call_type="pass_through_endpoint",
+            start_time=self.start_time,
+            litellm_call_id="test-call-id-123",
+            function_id="1245",
+            dynamic_success_callbacks=[],
+            dynamic_async_success_callbacks=[],
+        )
+        logging_obj.update_environment_variables(
+            model="gemini-3.1-flash-image",
+            user="unknown",
+            optional_params={},
+            litellm_params={
+                "metadata": {},
+                "proxy_server_request": {
+                    "url": url_route,
+                    "method": "POST",
+                    "body": {"contents": [{"parts": [{"text": "draw"}]}]},
+                    "headers": {},
+                },
+            },
+            call_type="pass_through_endpoint",
+        )
+        logging_obj.model_call_details["custom_llm_provider"] = "gemini"
+        raw_bytes = [
+            b'data: {"responseId":"resp-1","candidates":[{"content":{"role":"model","parts":'
+            b'[{"thought":true,"inlineData":{"mimeType":"image/png","data":"thinking-img"}},'
+            b'{"inlineData":{"mimeType":"image/png","data":"final-img"}}]},"finishReason":"STOP","index":0}],'
+            b'"usageMetadata":{"promptTokenCount":3279,"candidatesTokenCount":1423,"totalTokenCount":4702}}\n\n'
+        ]
+        response_cost_calculator = MagicMock(return_value=0.000261)
+        logging_obj._response_cost_calculator = response_cost_calculator
+
+        with (
+            patch.object(litellm, "_async_success_callback", []),
+            patch.object(litellm, "success_callback", []),
+            patch("litellm.proxy.proxy_server.llm_router", router),
+        ):
+            await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+                litellm_logging_obj=logging_obj,
+                passthrough_success_handler_obj=PassThroughEndpointLogging(),
+                url_route=url_route,
+                request_body={"contents": [{"parts": [{"text": "draw"}]}]},
+                endpoint_type=EndpointType.VERTEX_AI,
+                start_time=self.start_time,
+                raw_bytes=raw_bytes,
+                end_time=self.end_time,
+                model=None,
+            )
+
+        standard_logging_object = logging_obj.model_call_details["standard_logging_object"]
+        response = standard_logging_object["response"]
+        images = response["choices"][0]["message"]["images"]
+        assert logging_obj.model_call_details["response_cost"] == pytest.approx(0.017)
+        assert standard_logging_object["response_cost"] == pytest.approx(0.017)
+        assert len(images) == 1
+        assert images[0]["image_url"]["url"] == "data:image/png;base64,final-img"
+        response_cost_calculator.assert_not_called()
+        mock_vertex_handler.assert_not_called()
+        mock_completion_cost.assert_not_called()
+
     def test_gemini_passthrough_handler_non_gemini_route(self):
         """Test that non-Gemini routes return None"""
         mock_httpx_response = self._create_mock_httpx_response()
@@ -275,7 +525,8 @@ class TestGeminiPassthroughLoggingHandler:
 
     @pytest.mark.asyncio
     @patch(
-        "litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrough_logging_handler.litellm.completion_cost",
+        "litellm.proxy.pass_through_endpoints.llm_provider_handlers."
+        "gemini_passthrough_logging_handler.litellm.completion_cost",
         return_value=0.000050,
     )
     async def test_pass_through_success_handler_gemini_routing(

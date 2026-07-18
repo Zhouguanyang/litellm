@@ -232,8 +232,10 @@ class ModelInfoBase(ProviderSpecificModelInfo, total=False):
     output_cost_per_token_above_272k_tokens_priority: Optional[float]
     output_cost_per_token_above_512k_tokens: Optional[float]  # MiniMax-M3: prompts >512K priced at 2x output
     output_cost_per_character_above_128k_tokens: Optional[float]  # only for vertex ai models
+    output_cost_per_request: Optional[float]
     output_cost_per_image: Optional[float]
     output_cost_per_image_token: Optional[float]
+    force_output_cost_per_image: Optional[bool]
     output_vector_size: Optional[int]
     output_cost_per_reasoning_token: Optional[float]
     output_cost_per_video_per_second: Optional[float]  # only for vertex ai models
@@ -3044,8 +3046,10 @@ class CustomPricingLiteLLMParams(BaseModel):
     output_cost_per_token_above_200k_tokens_priority: Optional[float] = None
     output_cost_per_token_above_272k_tokens_priority: Optional[float] = None
     output_cost_per_character_above_128k_tokens: Optional[float] = None
+    output_cost_per_request: Optional[float] = None
     output_cost_per_image: Optional[float] = None
     output_cost_per_image_token: Optional[float] = None
+    force_output_cost_per_image: Optional[bool] = None
     output_cost_per_reasoning_token: Optional[float] = None
     output_cost_per_video_per_second: Optional[float] = None
     output_cost_per_audio_per_second: Optional[float] = None

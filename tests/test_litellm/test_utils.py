@@ -612,6 +612,7 @@ def validate_model_cost_values(model_data, exceptions=None):
         "output_cost_per_second_1080p",
         "input_cost_per_query",
         "input_cost_per_request",
+        "output_cost_per_request",
         "input_cost_per_audio_token",
         "output_cost_per_audio_token",
         "output_cost_per_image_token",
@@ -808,6 +809,7 @@ def test_aaamodel_prices_and_context_window_json_is_valid():
                 "output_cost_per_image": {"type": "number"},
                 "output_cost_per_image_token": {"type": "number"},
                 "output_cost_per_pixel": {"type": "number"},
+                "output_cost_per_request": {"type": "number"},
                 "output_cost_per_second": {"type": "number"},
                 "output_cost_per_second_1080p": {"type": "number"},
                 "output_cost_per_token": {"type": "number"},
@@ -4708,5 +4710,4 @@ class TestValidateEnvironmentTencent:
 
         assert result["keys_in_environment"] is False
         assert "TENCENT_API_KEY" in result["missing_keys"]
-
 
