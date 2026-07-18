@@ -421,6 +421,31 @@ def test_vertex_ai_thinking_output_part():
     assert reasoning_content == "I'm thinking..."
 
 
+def test_vertex_ai_thinking_image_part_is_not_output_image():
+    v = VertexGeminiConfig()
+    parts = [
+        {
+            "thought": True,
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": "thinking-image",
+            },
+        },
+        {
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": "final-image",
+            },
+        },
+    ]
+
+    images = v._extract_image_response_from_parts(parts=parts)
+
+    assert images is not None
+    assert len(images) == 1
+    assert images[0]["image_url"]["url"] == "data:image/png;base64,final-image"
+
+
 def test_vertex_ai_empty_content():
     from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
         VertexGeminiConfig,
