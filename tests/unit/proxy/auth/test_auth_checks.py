@@ -53,6 +53,69 @@ from litellm.proxy.utils import CallInfo
 from litellm.types.passthrough_endpoints.pass_through_endpoints import LITELLM_PASS_THROUGH_ENDPOINT_MARKER
 
 
+@pytest.mark.parametrize("request_price", (0.0, 0.02))
+@pytest.mark.parametrize("token_rate", (0.0, 0.001))
+def test_request_only_prices_do_not_waive_budget_checks(
+    local_model_cost_map: None, request_price: float, token_rate: float,
+) -> None:
+    litellm.register_model({"openai/fixed-request-budget": {
+        "litellm_provider": "openai", "mode": "chat",
+        "input_cost_per_token": token_rate, "output_cost_per_token": token_rate,
+    }})
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "fixed-request-budget",
+        "litellm_params": {"model": "openai/fixed-request-budget", "api_key": "unused"},
+        "model_info": {
+            "id": "fixed-request-budget-id",
+            "output_cost_per_request": request_price,
+        },
+    }])
+    assert is_model_cost_zero("fixed-request-budget", router) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_price,fixed_margin", ((0.0, 0.003), (0.02, 0.0), (0.02, 0.003)))
+@pytest.mark.parametrize("qualified", (False, True))
+@pytest.mark.parametrize("provider", ("openai", "gemini"))
+async def test_request_prices_control_admission_after_budget_exhaustion(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch, request_price: float,
+    fixed_margin: float, qualified: bool, provider: str,
+) -> None:
+    model: Final = "unit-request-priced-admission"
+    configured_model: Final = f"{provider}/{model}" if qualified else model
+    litellm.register_model({f"{provider}/{model}": {
+        "litellm_provider": provider, "mode": "chat",
+        "input_cost_per_token": 0.001, "output_cost_per_token": 0.002,
+    }})
+    monkeypatch.setattr(litellm, "max_budget", 1.0)
+    monkeypatch.setattr(litellm, "cost_margin_config", {provider: {"fixed_amount": fixed_margin}})
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "request-priced", "litellm_params": {
+            "model": configured_model, "custom_llm_provider": provider, "api_key": "unused",
+        },
+        "model_info": {"id": "request-priced-admission", "output_cost_per_request": request_price},
+    }])
+    request: Final = Request({"type": "http", "method": "POST", "path": "/chat/completions", "headers": []})
+
+    async def admit_request() -> bool:
+        return await common_checks(
+            request_body={"model": "request-priced", "messages": [{"role": "user", "content": "hello"}]},
+            team_object=None, user_object=None, end_user_object=None, global_proxy_spend=2.0,
+            general_settings={}, route="/chat/completions", llm_router=router,
+            proxy_logging_obj=ProxyLogging(user_api_key_cache=UserApiKeyCache()),
+            valid_token=UserAPIKeyAuth(token="unused"), request=request,
+            skip_budget_checks=is_model_cost_zero("request-priced", router),
+        )
+
+    charged: Final = litellm.completion_cost(
+        model=configured_model, custom_llm_provider=provider, custom_pricing=True,
+        router_model_id=router.model_list[0]["model_info"]["id"],
+    )
+    assert charged == pytest.approx(request_price + fixed_margin)
+    with pytest.raises(litellm.BudgetExceededError):
+        await admit_request()
+
+
 async def _run_team_trace_id_check(
     *,
     route: str,
