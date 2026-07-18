@@ -700,6 +700,13 @@ def generic_cost_per_token(
 
     ## GET MODEL INFO
     model_info = get_model_info(model=model, custom_llm_provider=custom_llm_provider)
+    if model_info.get("output_cost_per_request") is not None:
+        output_cost_per_request = _get_cost_per_unit(
+            model_info=model_info,
+            cost_key="output_cost_per_request",
+            default_value=0.0,
+        )
+        return 0.0, output_cost_per_request or 0.0
 
     ## CALCULATE INPUT COST
     ### Cost of processing (non-cache hit + cache hit) + Cost of cache-writing (cache writing)

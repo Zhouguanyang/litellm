@@ -42,6 +42,37 @@ def test_cost_per_token_duplicate_openai_prefix_matches_model_cost(monkeypatch):
     assert prompt_usd + completion_usd > 0
 
 
+def test_cost_per_token_output_cost_per_request_overrides_tokens(monkeypatch):
+    fixed_model = "gemini/gemini-fixed-request-test"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            **litellm.model_cost,
+            fixed_model: {
+                "input_cost_per_token": 1.0,
+                "litellm_provider": "gemini",
+                "max_input_tokens": 4096,
+                "max_output_tokens": 4096,
+                "max_tokens": 4096,
+                "mode": "chat",
+                "output_cost_per_request": 0.017,
+                "output_cost_per_token": 1.0,
+            },
+        },
+    )
+
+    prompt_usd, completion_usd = cost_per_token(
+        model="gemini-fixed-request-test",
+        prompt_tokens=3279,
+        completion_tokens=1423,
+        custom_llm_provider="gemini",
+    )
+
+    assert prompt_usd == 0.0
+    assert completion_usd == pytest.approx(0.017)
+
+
 def test_cost_per_token_non_string_model_does_not_hang():
     """
     The provider-prefix dedup loop must not spin forever when `model` is a
@@ -1048,6 +1079,78 @@ def test_tiered_pricing_only_deployment_selects_router_model_id():
     )
     assert selected is not None
     assert router_model_id in selected
+
+
+def test_output_cost_per_request_deployment_selects_router_model_id(monkeypatch):
+    from litellm.cost_calculator import _select_model_name_for_cost_calc
+
+    router_model_id = "gemini-flat-request-pricing-test"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            **litellm.model_cost,
+            router_model_id: {
+                "litellm_provider": "gemini",
+                "max_input_tokens": 65536,
+                "max_output_tokens": 32768,
+                "max_tokens": 32768,
+                "mode": "image_generation",
+                "output_cost_per_request": 0.017,
+            },
+        },
+    )
+
+    selected = _select_model_name_for_cost_calc(
+        model="gemini/gemini-3.1-flash-image",
+        completion_response=None,
+        custom_pricing=True,
+        custom_llm_provider="gemini",
+        router_model_id=router_model_id,
+    )
+
+    assert selected is not None
+    assert router_model_id in selected
+
+
+def test_output_cost_per_request_deployment_completion_cost(monkeypatch):
+    from litellm.types.utils import Choices, Message
+
+    router_model_id = "gemini-flat-request-cost-test"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            **litellm.model_cost,
+            router_model_id: {
+                "input_cost_per_token": 1.0,
+                "litellm_provider": "gemini",
+                "max_input_tokens": 65536,
+                "max_output_tokens": 32768,
+                "max_tokens": 32768,
+                "mode": "image_generation",
+                "output_cost_per_request": 0.017,
+                "output_cost_per_token": 1.0,
+            },
+        },
+    )
+
+    response = ModelResponse(
+        model="gemini/gemini-3.1-flash-image",
+        choices=[Choices(index=0, message=Message(role="assistant", content="hi"))],
+        usage=Usage(prompt_tokens=60, completion_tokens=14, total_tokens=74),
+    )
+    response._hidden_params = {"custom_llm_provider": "gemini", "model_id": router_model_id}
+
+    cost = completion_cost(
+        completion_response=response,
+        model="gemini/gemini-3.1-flash-image",
+        custom_llm_provider="gemini",
+        custom_pricing=True,
+        router_model_id=router_model_id,
+    )
+
+    assert cost == pytest.approx(0.017)
 
 
 def test_tiered_pricing_only_deployment_completion_cost_is_nonzero():

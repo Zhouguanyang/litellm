@@ -94,6 +94,7 @@ from litellm.types.llms.openai import (
 from litellm.types.rerank import RerankBilledUnits, RerankResponse
 from litellm.types.utils import (
     CallTypesLiteral,
+    CustomPricingLiteLLMParams,
     LiteLLMRealtimeStreamLoggingObject,
     LlmProviders,
     LlmProvidersSet,
@@ -118,6 +119,8 @@ from litellm.utils import (
     _cached_get_model_info_helper,
     token_counter,
 )
+
+_CUSTOM_PRICING_KEYS: frozenset[str] = frozenset(CustomPricingLiteLLMParams.model_fields.keys())
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import (
@@ -730,6 +733,11 @@ def _get_provider_for_cost_calc(
     return custom_llm_provider
 
 
+def _model_cost_entry_has_custom_pricing(model_cost_entry: ModelInfo) -> bool:
+    matching_keys = _CUSTOM_PRICING_KEYS & model_cost_entry.keys()
+    return any(model_cost_entry.get(key) is not None for key in matching_keys)
+
+
 def _select_model_name_for_cost_calc(
     model: Optional[str],
     completion_response: Optional[Any],
@@ -760,11 +768,7 @@ def _select_model_name_for_cost_calc(
     if custom_pricing is True:
         if router_model_id is not None and router_model_id in litellm.model_cost:
             entry = litellm.model_cost[router_model_id]
-            if (
-                entry.get("input_cost_per_token") is not None
-                or entry.get("input_cost_per_second") is not None
-                or entry.get("tiered_pricing") is not None
-            ):
+            if _model_cost_entry_has_custom_pricing(entry):
                 return_model = router_model_id
             else:
                 return_model = model
