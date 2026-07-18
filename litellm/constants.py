@@ -2252,6 +2252,18 @@ UNSAFE_PROXY_RESPONSE_HEADERS: Final[frozenset[str]] = HTTP_FRAMING_HEADERS | BR
 
 STRINGIFIED_NONE: Final[str] = "None"
 
+GENERIC_PASSTHROUGH_CALL_TYPES: Final = frozenset((
+    "pass_through_endpoint", "llm_passthrough_route", "allm_passthrough_route",
+))
+
+REQUEST_PRICED_CALL_TYPES: Final[frozenset[str]] = frozenset((
+    "completion", "acompletion", "text_completion", "atext_completion",
+    "image_generation", "aimage_generation", "image_edit", "aimage_edit",
+    "responses", "aresponses", "get_responses", "aget_responses", "anthropic_messages", "aanthropic_messages",
+    "generate_content", "agenerate_content", "generate_content_stream", "agenerate_content_stream",
+    "pass_through_endpoint", "llm_passthrough_route", "allm_passthrough_route", "passthrough-image-generation",
+))
+
 # A retrieved response replays the usage of the call that created it, so pricing these
 # read/management routes like inference bills the same tokens twice.
 NON_INFERENCE_CALL_TYPES: Final[frozenset[str]] = frozenset(

@@ -469,9 +469,7 @@ class TestOpenAIPassthroughLoggingHandler:
 
         assert result is None  # Placeholder implementation
 
-    @patch(f"{OpenAIPassthroughLoggingHandler.__module__}.get_standard_logging_object_payload")
-    @patch("litellm.completion_cost", return_value=3.3e-06)
-    def test_streaming_responses_cost_uses_completed_response(self, mock_completion_cost, mock_get_standard_logging):
+    def test_streaming_responses_cost_uses_completed_response(self, local_model_cost_map: None):
         response_id = "resp_PROOFSENTINEL0123456789abcdef"
         completed_event = {
             "type": "response.completed",
@@ -515,14 +513,17 @@ class TestOpenAIPassthroughLoggingHandler:
                 "top_p": 1.0,
             },
         }
-        logging_obj = self._create_mock_logging_obj()
+        logging_obj: Final = LiteLLMLoggingObj(
+            model="gpt-4o-mini", messages=[], stream=True, call_type="pass_through_endpoint",
+            start_time=self.start_time, litellm_call_id="native-responses", function_id="native-responses",
+        )
 
         result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
             litellm_logging_obj=logging_obj,
-            passthrough_success_handler_obj=MagicMock(),
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
             url_route="https://api.openai.com/v1/responses",
             request_body={"model": "gpt-4o-mini", "stream": True},
-            endpoint_type=MagicMock(),
+            endpoint_type=EndpointType.OPENAI,
             start_time=self.start_time,
             all_chunks=[f"data: {json.dumps(completed_event)}", "data: [DONE]"],
             end_time=self.end_time,
@@ -533,18 +534,15 @@ class TestOpenAIPassthroughLoggingHandler:
         assert response.model == "gpt-4o-mini-2024-07-18"
         assert response.usage.input_tokens == 14
         assert response.usage.output_tokens == 2
-        assert result["kwargs"]["response_cost"] == 3.3e-06
-        assert result["kwargs"]["standard_logging_object"] is mock_get_standard_logging.return_value
-        mock_completion_cost.assert_called_once_with(
-            completion_response=response,
-            model="gpt-4o-mini",
-            custom_llm_provider="openai",
-            call_type="responses",
+        model_info: Final = litellm.get_model_info(response.model, custom_llm_provider="openai")
+        expected: Final = (
+            response.usage.input_tokens * model_info["input_cost_per_token"]
+            + response.usage.output_tokens * model_info["output_cost_per_token"]
         )
+        assert result["kwargs"]["response_cost"] == pytest.approx(expected)
+        assert result["kwargs"]["standard_logging_object"]["response_cost"] == pytest.approx(expected)
 
-    @patch(f"{OpenAIPassthroughLoggingHandler.__module__}.get_standard_logging_object_payload")
-    @patch("litellm.completion_cost", return_value=2.1e-06)
-    def test_streaming_responses_incomplete_event_is_billed(self, mock_completion_cost, mock_get_standard_logging):
+    def test_streaming_responses_incomplete_event_is_billed(self, local_model_cost_map: None):
         response_id = "resp_INCOMPLETESENTINEL0123456789ab"
         incomplete_event = {
             "type": "response.incomplete",
@@ -588,14 +586,17 @@ class TestOpenAIPassthroughLoggingHandler:
                 "top_p": 1.0,
             },
         }
-        logging_obj = self._create_mock_logging_obj()
+        logging_obj: Final = LiteLLMLoggingObj(
+            model="gpt-4o-mini", messages=[], stream=True, call_type="pass_through_endpoint",
+            start_time=self.start_time, litellm_call_id="native-responses", function_id="native-responses",
+        )
 
         result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
             litellm_logging_obj=logging_obj,
-            passthrough_success_handler_obj=MagicMock(),
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
             url_route="https://api.openai.com/v1/responses",
             request_body={"model": "gpt-4o-mini", "stream": True},
-            endpoint_type=MagicMock(),
+            endpoint_type=EndpointType.OPENAI,
             start_time=self.start_time,
             all_chunks=[f"data: {json.dumps(incomplete_event)}"],
             end_time=self.end_time,
@@ -605,18 +606,15 @@ class TestOpenAIPassthroughLoggingHandler:
         assert response.id == response_id
         assert response.status == "incomplete"
         assert response.usage.output_tokens == 32
-        assert result["kwargs"]["response_cost"] == 2.1e-06
-        assert result["kwargs"]["standard_logging_object"] is mock_get_standard_logging.return_value
-        mock_completion_cost.assert_called_once_with(
-            completion_response=response,
-            model="gpt-4o-mini",
-            custom_llm_provider="openai",
-            call_type="responses",
+        model_info: Final = litellm.get_model_info(response.model, custom_llm_provider="openai")
+        expected: Final = (
+            response.usage.input_tokens * model_info["input_cost_per_token"]
+            + response.usage.output_tokens * model_info["output_cost_per_token"]
         )
+        assert result["kwargs"]["response_cost"] == pytest.approx(expected)
+        assert result["kwargs"]["standard_logging_object"]["response_cost"] == pytest.approx(expected)
 
-    @patch(f"{OpenAIPassthroughLoggingHandler.__module__}.get_standard_logging_object_payload")
-    @patch("litellm.completion_cost", return_value=1.4e-06)
-    def test_streaming_responses_failed_event_is_billed(self, mock_completion_cost, mock_get_standard_logging):
+    def test_streaming_responses_failed_event_is_billed(self, local_model_cost_map: None):
         response_id = "resp_FAILEDSENTINEL0123456789abcd"
         failed_event = {
             "type": "response.failed",
@@ -646,14 +644,17 @@ class TestOpenAIPassthroughLoggingHandler:
                 "top_p": 1.0,
             },
         }
-        logging_obj = self._create_mock_logging_obj()
+        logging_obj: Final = LiteLLMLoggingObj(
+            model="gpt-4o-mini", messages=[], stream=True, call_type="pass_through_endpoint",
+            start_time=self.start_time, litellm_call_id="native-responses", function_id="native-responses",
+        )
 
         result = OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
             litellm_logging_obj=logging_obj,
-            passthrough_success_handler_obj=MagicMock(),
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
             url_route="https://api.openai.com/v1/responses",
             request_body={"model": "gpt-4o-mini", "stream": True},
-            endpoint_type=MagicMock(),
+            endpoint_type=EndpointType.OPENAI,
             start_time=self.start_time,
             all_chunks=[f"data: {json.dumps(failed_event)}"],
             end_time=self.end_time,
@@ -663,14 +664,13 @@ class TestOpenAIPassthroughLoggingHandler:
         assert response.id == response_id
         assert response.status == "failed"
         assert response.usage.total_tokens == 21
-        assert result["kwargs"]["response_cost"] == 1.4e-06
-        assert result["kwargs"]["standard_logging_object"] is mock_get_standard_logging.return_value
-        mock_completion_cost.assert_called_once_with(
-            completion_response=response,
-            model="gpt-4o-mini",
-            custom_llm_provider="openai",
-            call_type="responses",
+        model_info: Final = litellm.get_model_info(response.model, custom_llm_provider="openai")
+        expected: Final = (
+            response.usage.input_tokens * model_info["input_cost_per_token"]
+            + response.usage.output_tokens * model_info["output_cost_per_token"]
         )
+        assert result["kwargs"]["response_cost"] == pytest.approx(expected)
+        assert result["kwargs"]["standard_logging_object"]["response_cost"] == pytest.approx(expected)
 
     @patch(f"{OpenAIPassthroughLoggingHandler.__module__}.get_standard_logging_object_payload", return_value=None)
     @patch("litellm.completion_cost", return_value=3.3e-06)
@@ -1698,131 +1698,51 @@ class TestOpenAIPassthroughIntegration:
 
         assert calculated_cost == test_cost, f"Expected {test_cost}, got {calculated_cost}"
 
-    @patch("litellm.cost_calculator.default_image_cost_calculator")
-    def test_openai_passthrough_handler_image_generation(self, mock_image_cost_calculator):
-        """Test successful cost tracking for OpenAI image generation"""
-        # Arrange
-        mock_image_cost_calculator.return_value = 0.040
 
-        mock_image_response = {
-            "data": [
-                {
-                    "url": "https://example.com/image1.png",
-                    "revised_prompt": "A beautiful sunset over the ocean",
-                }
-            ]
-        }
-
-        mock_httpx_response = self._create_mock_httpx_response(mock_image_response)
-        mock_logging_obj = self._create_mock_logging_obj()
-        passthrough_payload = self._create_passthrough_logging_payload()
-
-        kwargs = {
-            "passthrough_logging_payload": passthrough_payload,
-            "model": "dall-e-3",
-        }
-
-        request_body = {
-            "model": "dall-e-3",
-            "prompt": "A beautiful sunset over the ocean",
-            "n": 1,
-            "size": "1024x1024",
-            "quality": "standard",
-        }
-
-        # Act
-        result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
-            httpx_response=mock_httpx_response,
-            response_body=mock_image_response,
-            logging_obj=mock_logging_obj,
-            url_route="https://api.openai.com/v1/images/generations",
-            result="",
-            start_time=self.start_time,
-            end_time=self.end_time,
-            cache_hit=False,
-            request_body=request_body,
-            **kwargs,
-        )
-
-        # Assert
-        assert result is not None
-        assert "result" in result
-        assert "kwargs" in result
-        assert result["kwargs"]["response_cost"] == 0.040
-        assert result["kwargs"]["model"] == "dall-e-3"
-        assert result["kwargs"]["custom_llm_provider"] == "openai"
-        assert result["result"].hidden_params["response_cost"] == 0.040
-
-        # Verify cost calculation was called
-        mock_image_cost_calculator.assert_called_once()
-
-        # Verify logging object was updated
-        assert mock_logging_obj.model_call_details["response_cost"] == 0.040
-        assert mock_logging_obj.model_call_details["model"] == "dall-e-3"
-        assert mock_logging_obj.model_call_details["custom_llm_provider"] == "openai"
-
-    @patch("litellm.cost_calculator.default_image_cost_calculator")
-    def test_openai_passthrough_handler_image_editing(self, mock_image_cost_calculator):
-        """Test successful cost tracking for OpenAI image editing"""
-        # Arrange
-        mock_image_cost_calculator.return_value = 0.020
-
-        mock_image_response = {
-            "data": [
-                {
-                    "url": "https://example.com/edited_image.png",
-                    "revised_prompt": "A beautiful sunset over the ocean with added clouds",
-                }
-            ]
-        }
-
-        mock_httpx_response = self._create_mock_httpx_response(mock_image_response)
-        mock_logging_obj = self._create_mock_logging_obj()
-        passthrough_payload = self._create_passthrough_logging_payload()
-
-        kwargs = {
-            "passthrough_logging_payload": passthrough_payload,
-            "model": "dall-e-2",
-        }
-
-        request_body = {
-            "model": "dall-e-2",
-            "prompt": "Add clouds to the sky",
-            "n": 1,
-            "size": "1024x1024",
-        }
-
-        # Act
-        result = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
-            httpx_response=mock_httpx_response,
-            response_body=mock_image_response,
-            logging_obj=mock_logging_obj,
-            url_route="https://api.openai.com/v1/images/edits",
-            result="",
-            start_time=self.start_time,
-            end_time=self.end_time,
-            cache_hit=False,
-            request_body=request_body,
-            **kwargs,
-        )
-
-        # Assert
-        assert result is not None
-        assert "result" in result
-        assert "kwargs" in result
-        assert result["kwargs"]["response_cost"] == 0.020
-        assert result["kwargs"]["model"] == "dall-e-2"
-        assert result["kwargs"]["custom_llm_provider"] == "openai"
-        assert result["result"].hidden_params["response_cost"] == 0.020
-
-        # Verify cost calculation was called
-        mock_image_cost_calculator.assert_called_once()
-
-        # Verify logging object was updated
-        assert mock_logging_obj.model_call_details["response_cost"] == 0.020
-        assert mock_logging_obj.model_call_details["model"] == "dall-e-2"
-        assert mock_logging_obj.model_call_details["custom_llm_provider"] == "openai"
-
+@pytest.mark.parametrize("endpoint", ("generations", "edits"))
+@pytest.mark.parametrize("image_count", (1, 3))
+@pytest.mark.parametrize("request_price", (None, 0.0, 0.02))
+@pytest.mark.parametrize("metadata_key", ("metadata", "litellm_metadata"))
+def test_native_images_use_the_successful_deployment_request_price(
+    local_model_cost_map: None, endpoint: str, image_count: int,
+    request_price: float | None, metadata_key: str,
+) -> None:
+    model: Final = "unit-native-image-request-price"
+    image_price: Final = 0.4
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "image_generation", "output_cost_per_image": image_price,
+    }})
+    router: Final = litellm.Router(model_list=[
+        {
+            "model_name": "primary", "litellm_params": {"model": f"openai/{model}", "api_key": "unused"},
+            "model_info": {"id": "native-image-primary", "output_cost_per_request": 0.01},
+        },
+        {
+            "model_name": "backup", "litellm_params": {"model": f"openai/{model}", "api_key": "unused"},
+            "model_info": {
+                "id": "native-image-backup",
+                **({"output_cost_per_request": request_price} if request_price is not None else {}),
+            },
+        },
+    ])
+    now: Final = datetime(2026, 1, 1)
+    logger: Final = LiteLLMLoggingObj(
+        model=model, messages=[], stream=False, call_type="pass_through_endpoint",
+        start_time=now, litellm_call_id="native-image-price", function_id="native-image-price",
+    )
+    logger.update_environment_variables(
+        optional_params={}, litellm_params={metadata_key: {"model_info": router.model_list[1]["model_info"]}},
+    )
+    body: Final = {"data": [{"url": "https://images.test/generated.png"} for _ in range(image_count)]}
+    result: Final = OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+        httpx_response=httpx.Response(200, json=body), response_body=body, logging_obj=logger,
+        url_route=f"https://api.openai.com/v1/images/{endpoint}", result="", start_time=now, end_time=now,
+        cache_hit=False, request_body={"model": model, "n": image_count, "size": "1024x1024"},
+    )
+    expected: Final = image_price * image_count if request_price is None else request_price
+    assert result["kwargs"]["response_cost"] == pytest.approx(expected)
+    assert logger.model_call_details["response_cost"] == pytest.approx(expected)
+    assert logger.response_cost_calculator(result["result"]) == pytest.approx(expected)
 
 class TestOpenAIPassthroughResponsesStreamingSpendLog:
     """A streamed OpenAI-passthrough `/v1/responses` call must write a priced spend
@@ -2715,3 +2635,239 @@ def test_count_relayed_prompt_tokens_charges_an_uppercase_scheme_remote_high_det
     assert count_relayed_prompt_tokens("gpt-4.1-mini", messages) == (
         litellm.token_counter(model="gpt-4.1-mini", messages=TEXT_ONLY_MESSAGES) + high_detail_image_token_upper_bound()
     )
+
+
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("responses", (False, True))
+@pytest.mark.parametrize("metadata_key", ("metadata", "litellm_metadata"))
+@pytest.mark.parametrize(
+    "backup_pricing",
+    (
+        {},
+        {"output_cost_per_request": 0.0},
+        {"output_cost_per_request": 0.02},
+    ),
+)
+@pytest.mark.parametrize("provider", ("openai", "azure"))
+def test_openai_passthrough_prices_the_successful_deployment(
+    local_model_cost_map: None,
+    stream: bool,
+    responses: bool,
+    metadata_key: str,
+    backup_pricing: dict[str, float],
+    provider: str,
+) -> None:
+    model: Final = "openai-fallback-pricing-test"
+    prompt_tokens: Final = 10
+    litellm.register_model(
+        {
+            f"{provider}/{model}": {
+                "litellm_provider": provider,
+                "mode": "chat",
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            }
+        }
+    )
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": f"{provider}/{model}", "api_key": "unused"},
+                "model_info": {"id": "primary", "output_cost_per_request": 0.01},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {"model": f"{provider}/{model}", "api_key": "unused"},
+                "model_info": {
+                    "id": "backup",
+                    **backup_pricing,
+                },
+            },
+        ]
+    )
+    now: Final = datetime(2026, 1, 1)
+    logging_obj: Final = LiteLLMLoggingObj(
+        model=model,
+        messages=[],
+        stream=stream,
+        call_type="pass_through_endpoint",
+        start_time=now,
+        litellm_call_id="fallback-pricing",
+        function_id="fallback-pricing",
+    )
+    logging_obj.update_environment_variables(
+        optional_params={},
+        litellm_params={metadata_key: {"model_info": router.model_list[1]["model_info"]}},
+    )
+    logging_obj.model_call_details["custom_llm_provider"] = provider
+    body: Final = (
+        {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1,
+            "model": model,
+            "status": "completed",
+            "error": None,
+            "incomplete_details": None,
+            "output": [],
+            "usage": {"input_tokens": prompt_tokens, "output_tokens": 20, "total_tokens": prompt_tokens + 20},
+        }
+        if responses
+        else {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 20, "total_tokens": prompt_tokens + 20},
+        }
+    )
+    stream_body: Final = (
+        {"type": "response.completed", "sequence_number": 1, "response": body}
+        if responses
+        else {
+            **body,
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        }
+    )
+    route: Final = "https://api.openai.com/v1/" + ("responses" if responses else "chat/completions")
+    result: Final = (
+        OpenAIPassthroughLoggingHandler.handle_logging_openai_collected_chunks(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route=route,
+            request_body={"model": model},
+            endpoint_type=EndpointType.OPENAI,
+            start_time=now,
+            end_time=now,
+            all_chunks=[f"data: {json.dumps(stream_body)}\n\n", "data: [DONE]"],
+        )
+        if stream
+        else OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+            httpx_response=httpx.Response(200, json=body),
+            response_body=body,
+            logging_obj=logging_obj,
+            url_route=route,
+            result="",
+            start_time=now,
+            end_time=now,
+            cache_hit=False,
+            request_body={"model": model},
+            custom_llm_provider=provider,
+        )
+    )
+    expected: Final = (
+        backup_pricing["output_cost_per_request"]
+        if "output_cost_per_request" in backup_pricing
+        else prompt_tokens * backup_pricing.get("input_cost_per_token", 0.001)
+        + 20 * backup_pricing.get("output_cost_per_token", 0.002)
+    )
+
+    assert result["kwargs"]["response_cost"] == pytest.approx(expected)
+    assert logging_obj.model_call_details["response_cost"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("ptu_attribution", (False, True))
+@pytest.mark.parametrize("spilled_over", (False, True))
+def test_azure_passthrough_charges_pay_as_you_go_for_ptu_spillover(
+    local_model_cost_map: None,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+    ptu_attribution: bool,
+    spilled_over: bool,
+) -> None:
+    monkeypatch.setenv("LITELLM_ENABLE_PTU_COST_ATTRIBUTION", str(ptu_attribution))
+    model: Final = "ptu-spillover-billing-test"
+    deployment_id: Final = "ptu-spillover-deployment"
+    litellm.register_model(
+        {
+            f"azure/{model}": {
+                "litellm_provider": "azure",
+                "mode": "chat",
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            },
+            deployment_id: {
+                "litellm_provider": "azure",
+                "mode": "chat",
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+                "output_cost_per_request": 0.0,
+            },
+        }
+    )
+    now: Final = datetime(2026, 1, 1)
+    logger: Final = LiteLLMLoggingObj(
+        model=f"azure/{model}",
+        messages=[],
+        stream=stream,
+        call_type="pass_through_endpoint",
+        start_time=now,
+        litellm_call_id="ptu-spillover",
+        function_id="ptu-spillover",
+    )
+    logger.update_environment_variables(
+        optional_params={},
+        litellm_params={
+            "metadata": {
+                "model_info": {
+                    "id": deployment_id,
+                    "team_id": "test-team",
+                    "ptu_count": 1,
+                    "cost_per_ptu_per_hour": 1.0,
+                    "ptu_effective_from": "2026-01-01",
+                    "input_cost_per_token": 0.0,
+                    "output_cost_per_token": 0.0,
+                }
+            }
+        },
+    )
+    logger.model_call_details["custom_llm_provider"] = "azure"
+    headers: Final = {"x-ms-is-spilled-over": "true"} if spilled_over else {}
+    logger.model_call_details["response_headers"] = headers
+    body: Final = {
+        "id": "chatcmpl-spillover",
+        "object": "chat.completion",
+        "created": 1,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+    }
+    route: Final = "https://test.openai.azure.com/v1/chat/completions"
+    stream_body: Final = {
+        **body,
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+    }
+    result: Final = (
+        OpenAIPassthroughLoggingHandler.handle_logging_openai_collected_chunks(
+            litellm_logging_obj=logger,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route=route,
+            request_body={"model": model},
+            endpoint_type=EndpointType.OPENAI,
+            start_time=now,
+            end_time=now,
+            all_chunks=[f"data: {json.dumps(stream_body)}\n\n", "data: [DONE]"],
+        )
+        if stream
+        else OpenAIPassthroughLoggingHandler.openai_passthrough_handler(
+            httpx_response=httpx.Response(200, json=body, headers=headers),
+            response_body=body,
+            logging_obj=logger,
+            url_route=route,
+            result="",
+            start_time=now,
+            end_time=now,
+            cache_hit=False,
+            request_body={"model": model},
+            custom_llm_provider="azure",
+        )
+    )
+
+    expected: Final = 100 * 0.001 + 50 * 0.002 if ptu_attribution and spilled_over else 0.0
+    assert result["kwargs"]["response_cost"] == pytest.approx(expected)
+    assert logger.model_call_details["response_cost"] == pytest.approx(expected)

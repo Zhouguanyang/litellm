@@ -1,8 +1,10 @@
 import asyncio
+from collections.abc import Iterator
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
 import litellm
+from litellm.litellm_core_utils.asyncify import run_async_function
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.custom_httpx.sse_lines import aiter_sse_lines, iter_sse_lines
 from litellm.proxy.pass_through_endpoints.success_handler import (
@@ -24,7 +26,7 @@ def _encode_google_genai_sse_event(event_lines: list[str]) -> bytes:
     return ("\n".join(event_lines) + "\n\n").encode("utf-8")
 
 
-def _next_google_genai_sse_chunk(line_iter) -> bytes:
+def _next_google_genai_sse_chunk(line_iter: Iterator[str]) -> bytes:
     event_lines: Final[list[str]] = []
     while True:
         try:
@@ -85,23 +87,24 @@ class BaseGoogleGenAIGenerateContentStreamingIterator:
         self,
     ):
         """Handle the logging after all chunks have been collected."""
+        asyncio.create_task(self._log_streaming_response())
+
+    async def _log_streaming_response(self) -> None:
         from litellm.proxy.pass_through_endpoints.streaming_handler import (
             PassThroughStreamingHandler,
         )
 
         end_time: Final = datetime.now()
-        asyncio.create_task(
-            PassThroughStreamingHandler.route_streaming_logging_to_handler(
-                litellm_logging_obj=self.litellm_logging_obj,
-                passthrough_success_handler_obj=GLOBAL_PASS_THROUGH_SUCCESS_HANDLER_OBJ,
-                url_route="/v1/generateContent",
-                request_body=self.request_body or {},
-                endpoint_type=self.endpoint_type,
-                start_time=self.start_time,
-                raw_bytes=self.collected_chunks,
-                end_time=end_time,
-                model=self.model,
-            )
+        await PassThroughStreamingHandler.route_streaming_logging_to_handler(
+            litellm_logging_obj=self.litellm_logging_obj,
+            passthrough_success_handler_obj=GLOBAL_PASS_THROUGH_SUCCESS_HANDLER_OBJ,
+            url_route="/v1/generateContent",
+            request_body=self.request_body or {},
+            endpoint_type=self.endpoint_type,
+            start_time=self.start_time,
+            raw_bytes=self.collected_chunks,
+            end_time=end_time,
+            model=self.model,
         )
 
 
@@ -135,6 +138,7 @@ class GoogleGenAIGenerateContentStreamingIterator(BaseGoogleGenAIGenerateContent
         # Gemini streamGenerateContent uses SSE line framing; iter_sse_lines keeps
         # large inlineData payloads (e.g. image/jpeg) intact within one event.
         self.stream_iterator = iter_sse_lines(response.iter_text())
+        self._logging_complete = False
 
     def __iter__(self):
         return self
@@ -145,7 +149,11 @@ class GoogleGenAIGenerateContentStreamingIterator(BaseGoogleGenAIGenerateContent
             self.collected_chunks.append(chunk)
             return chunk
         except StopIteration:
-            raise StopIteration
+            if not self._logging_complete:
+                self._logging_complete = True
+                if self.collected_chunks:
+                    run_async_function(self._log_streaming_response)
+            raise
 
     def __aiter__(self):
         return self

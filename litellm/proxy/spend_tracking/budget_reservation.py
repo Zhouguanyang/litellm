@@ -17,8 +17,15 @@ from pydantic import ConfigDict, TypeAdapter
 import litellm
 from litellm._internal_context import with_service_target
 from litellm._logging import verbose_proxy_logger
-from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
+from litellm.constants import REQUEST_PRICED_CALL_TYPES
+from litellm.cost_calculator import flat_request_cost
+from litellm.litellm_core_utils.api_route_to_call_types import (
+    get_call_types_for_route,
+    get_passthrough_call_types_for_route,
+)
 from litellm.litellm_core_utils.duration_parser import duration_in_seconds
+from litellm.litellm_core_utils.internal_call_metadata import is_token_counting_route
+from litellm.litellm_core_utils.litellm_logging import deployment_request_price
 from litellm.litellm_core_utils.llm_cost_calc.tiered_pricing import select_tier_for_input, tier_rate
 from litellm.proxy._types import (
     Litellm_EntityType,
@@ -53,7 +60,7 @@ from litellm.proxy.utils import PrismaClient, ProxyLogging
 from litellm.router import Router
 from litellm.types.proxy.model_access_group_budget import ModelAccessGroupBudget
 from litellm.types.router import DeploymentTypedDict
-from litellm.types.utils import CallTypes
+from litellm.types.utils import CallTypes, ModelInfo
 
 
 @dataclass
@@ -255,7 +262,7 @@ async def reserve_budget_for_request(
 ) -> dict | None:
     if valid_token is None or not RouteChecks.is_llm_api_route(route=route):
         return None
-    if RouteChecks.is_unbilled_route(route):
+    if RouteChecks.is_unbilled_route(route) or is_token_counting_route(route):
         return None
     if get_model_from_request(request_body, route, llm_router=llm_router) is None:
         return None
@@ -1353,6 +1360,9 @@ def _estimate_request_input_cost_for_model(
     llm_router: Router | None,
     input_tokens: int | None = None,
 ) -> float | None:
+    request_costs: Final = _deployment_request_cost_estimates(model, route, llm_router)
+    if request_costs and all(cost is not None for cost in request_costs):
+        return 0.0
     estimates: Final = [
         _input_cost_for_cost_info(
             request_body=request_body,
@@ -1361,7 +1371,7 @@ def _estimate_request_input_cost_for_model(
             model_info=model_info,
             input_tokens=input_tokens,
         )
-        for model_info in _get_model_cost_infos(model=model, llm_router=llm_router)
+        for model_info in _token_cost_infos_for_request(model, llm_router, request_costs)
     ]
     valid_estimates: Final = [estimate for estimate in estimates if estimate is not None]
     return max(valid_estimates) if valid_estimates else None
@@ -1401,6 +1411,10 @@ def _estimate_request_max_cost_for_model(
     llm_router: Router | None,
     input_tokens: int | None = None,
 ) -> float | None:
+    request_costs: Final = _deployment_request_cost_estimates(model, route, llm_router)
+    priced_costs: Final = tuple(cost for cost in request_costs if cost is not None)
+    if priced_costs and len(priced_costs) == len(request_costs):
+        return max(priced_costs)
     estimates: Final = [
         _max_cost_for_cost_info(
             request_body=request_body,
@@ -1409,10 +1423,65 @@ def _estimate_request_max_cost_for_model(
             model_info=model_info,
             input_tokens=input_tokens,
         )
-        for model_info in _get_model_cost_infos(model=model, llm_router=llm_router)
+        for model_info in _token_cost_infos_for_request(model, llm_router, request_costs)
     ]
-    valid_estimates: Final = [estimate for estimate in estimates if estimate is not None]
+    valid_estimates: Final = [estimate for estimate in (*estimates, *priced_costs) if estimate is not None]
     return max(valid_estimates) if valid_estimates else None
+
+
+def _deployment_request_cost_estimates(model: str, route: str, llm_router: Router | None) -> tuple[float | None, ...]:
+    if llm_router is None:
+        return ()
+    call_types: Final = get_passthrough_call_types_for_route(route, model_group=model)
+    if not RouteChecks.is_generate_content_route(route) and not any(
+        kind.value in REQUEST_PRICED_CALL_TYPES for kind in call_types or ()
+    ):
+        return ()
+    return tuple(
+        _deployment_request_cost(deployment) for deployment in _routed_pricing_deployments(model, llm_router)
+    )
+
+
+def _deployment_request_cost(deployment: DeploymentTypedDict) -> float | None:
+    params: Final = _get_value(deployment, "litellm_params")
+    model: Final = _get_value(params, "model")
+    provider: Final = _get_value(params, "custom_llm_provider")
+    if not isinstance(model, str):
+        return None
+    model_id: Final = _get_value(_get_value(deployment, "model_info"), "id")
+    request_price: Final = deployment_request_price(model_id if isinstance(model_id, str) else None)
+    if request_price is None:
+        return None
+    return flat_request_cost(
+        price=request_price, model=model,
+        custom_llm_provider=provider if isinstance(provider, str) else None,
+    )
+
+
+def _token_cost_infos_for_request(
+    model: str, llm_router: Router | None, request_costs: tuple[float | None, ...],
+) -> Sequence[Mapping[str, object]]:
+    if llm_router is None or not any(cost is not None for cost in request_costs):
+        return _get_model_cost_infos(model=model, llm_router=llm_router)
+    return tuple(
+        info
+        for deployment, cost in zip(_routed_pricing_deployments(model, llm_router), request_costs)
+        if cost is None and (info := _deployment_cost_info(deployment, llm_router)) is not None
+    )
+
+
+def _routed_pricing_deployments(model: str, llm_router: Router) -> Sequence[DeploymentTypedDict]:
+    registry: Final = llm_router.registry()
+    resolved: Final = registry.resolve(model, kind="alias") or model
+    return registry.deployments(resolved, source="routed_group")
+
+
+def _deployment_cost_info(deployment: DeploymentTypedDict, llm_router: Router) -> ModelInfo | None:
+    model_id: Final = _get_value(_get_value(deployment, "model_info"), "id")
+    backend_model: Final = _get_value(_get_value(deployment, "litellm_params"), "model")
+    if not isinstance(model_id, str) or not isinstance(backend_model, str):
+        return None
+    return llm_router.registry().deployment_model_info(model_id, backend_model, cached=True)
 
 
 def _max_cost_for_cost_info(
@@ -1559,11 +1628,7 @@ def _deployment_tiered_pricing_table(
     deployment: DeploymentTypedDict,
     llm_router: Router,
 ) -> Sequence[Mapping[str, object]] | None:
-    model_id: Final = _get_value(_get_value(deployment, "model_info"), "id")
-    backend_model: Final = _get_value(_get_value(deployment, "litellm_params"), "model")
-    if not isinstance(model_id, str) or not isinstance(backend_model, str):
-        return None
-    deployment_model_info: Final = llm_router.registry().deployment_model_info(model_id, backend_model, cached=True)
+    deployment_model_info: Final = _deployment_cost_info(deployment, llm_router)
     if deployment_model_info is None:
         return None
     tiered_pricing: Final = deployment_model_info.get("tiered_pricing")
@@ -1578,7 +1643,7 @@ def _get_deployment_tiered_pricing_tables(
 ) -> Sequence[Sequence[Mapping[str, object]]]:
     if llm_router is None:
         return []
-    deployments: Final = llm_router.registry().deployments(model) or []
+    deployments: Final = _routed_pricing_deployments(model, llm_router)
     return [
         table
         for deployment in deployments

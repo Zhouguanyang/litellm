@@ -19,13 +19,23 @@ from litellm import verbose_logger
 from litellm.constants import (
     DEFAULT_MAX_LRU_CACHE_SIZE,
     DEFAULT_REPLICATE_GPU_PRICE_PER_SECOND,
+    GENERIC_PASSTHROUGH_CALL_TYPES,
     OPENAI_LIVE_TERMINAL_RESPONSE_EVENT_TYPES,
     REALTIME_METERED_USAGE_KEY,
+    REQUEST_PRICED_CALL_TYPES,
 )
-from litellm.litellm_core_utils.core_helpers import as_str_mapping, billed_usage_cost
+from litellm.litellm_core_utils.api_route_to_call_types import get_passthrough_call_types_for_route
+from litellm.litellm_core_utils.core_helpers import as_str_mapping, attribute_or_none, billed_usage_cost
 from litellm.litellm_core_utils.cost_discount import resolve_cost_discount
 from litellm.litellm_core_utils.decisions_pricing import decisions_pricing_fields, is_decisions_call_type
 from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR
+from litellm.litellm_core_utils.internal_call_metadata import (
+    is_passthrough_batch_management_call,
+    is_pending_background_response,
+    is_token_counting_passthrough,
+    passthrough_request_routes,
+    passthrough_response_payload,
+)
 from litellm.litellm_core_utils.llm_cost_calc.tool_call_cost_tracking import (
     StandardBuiltInToolCostTracking,
 )
@@ -1333,6 +1343,37 @@ def infer_call_type(call_type: CallTypesLiteral | None, completion_response: obj
 _infer_call_type = infer_call_type
 
 
+def is_request_priced_call(call_type: str, completion_response: object, call_details: object = None) -> bool:
+    if call_type not in REQUEST_PRICED_CALL_TYPES or is_passthrough_batch_management_call(
+        call_type, completion_response
+    ) or is_token_counting_passthrough(call_type, call_details):
+        return False
+    generic: Final = call_type in GENERIC_PASSTHROUGH_CALL_TYPES
+    payload: Final = passthrough_response_payload(completion_response) if generic else completion_response
+    endpoint_types: Final = next((
+        kinds
+        for route in passthrough_request_routes(call_details)
+        if (kinds := get_passthrough_call_types_for_route(route)) is not None
+        and any(kind.value not in GENERIC_PASSTHROUGH_CALL_TYPES for kind in kinds)
+    ), None) if generic else None
+    if endpoint_types is not None and not any(
+        kind.value in REQUEST_PRICED_CALL_TYPES for kind in endpoint_types
+    ):
+        return False
+    response_call_type: Final = (
+        "responses" if isinstance(payload, ResponsesAPIResponse) else infer_call_type(None, payload)
+    )
+    if response_call_type is not None:
+        return response_call_type in REQUEST_PRICED_CALL_TYPES
+    if not generic:
+        return True
+    mapping: Final = as_str_mapping(payload)
+    object_type: Final = mapping.get("object") if mapping is not None else attribute_or_none(payload, "object")
+    if isinstance(object_type, str):
+        return object_type in ("chat.completion", "chat.completion.chunk", "text_completion", "response")
+    return endpoint_types is not None
+
+
 def _apply_cost_discount(
     base_cost: float,
     custom_llm_provider: str | None,
@@ -1514,6 +1555,39 @@ def _without_provider_stated_cost(usage: Usage | None) -> Usage | None:
     if usage is None or getattr(usage, "cost", None) is None:
         return usage
     return usage.model_copy(update=MappingProxyType({"cost": None}))
+
+
+def flat_request_cost(
+    price: float,
+    model: str | None,
+    custom_llm_provider: str | None,
+    region_name: str | None = None,
+    logging_obj: LitellmLoggingObject | None = None,
+) -> float:
+    provider: Final = _get_provider_for_cost_calc(model, custom_llm_provider)
+    discounted, discount_percent, discount_amount = _apply_cost_discount(
+        price, provider, model, region_name
+    )
+    total, margin_percent, margin_fixed_amount, margin_total_amount = _apply_cost_margin(
+        discounted, provider
+    )
+    _store_cost_breakdown_in_logging_obj(
+        litellm_logging_obj=logging_obj,
+        prompt_tokens_cost_usd_dollar=0.0,
+        completion_tokens_cost_usd_dollar=price,
+        cost_for_built_in_tools_cost_usd_dollar=0.0,
+        total_cost_usd_dollar=total,
+        original_cost=price,
+        discount_percent=discount_percent,
+        discount_amount=discount_amount,
+        margin_percent=margin_percent,
+        margin_fixed_amount=margin_fixed_amount,
+        margin_total_amount=margin_total_amount,
+        cache_read_cost=0.0,
+        cache_creation_cost=0.0,
+        reasoning_cost=0.0,
+    )
+    return total
 
 
 def _split_responses_ws_logging_object_by_service_tier(
@@ -1704,6 +1778,32 @@ def completion_cost(
             raise ValueError("Cannot calculate Decisions cost: provider did not report usage")
         if pricing_provider is not None:
             custom_llm_provider = pricing_provider  # rebind-ok: model_info.pricing_provider overrides the routing provider for cost-map lookups
+
+        if is_passthrough_batch_management_call(call_type, completion_response) or (
+            call_type in GENERIC_PASSTHROUGH_CALL_TYPES and litellm_logging_obj is not None
+            and is_token_counting_passthrough(call_type, litellm_logging_obj.model_call_details)
+        ):
+            return 0.0
+
+        deployment_pricing: Final = _deployment_model_info(litellm_logging_obj, custom_pricing, router_model_id)
+        request_price: Final = (
+            deployment_pricing.get("output_cost_per_request") if deployment_pricing is not None else None
+        )
+        if request_price is not None and is_request_priced_call(
+            call_type, completion_response,
+            litellm_logging_obj.model_call_details
+            if call_type in GENERIC_PASSTHROUGH_CALL_TYPES and litellm_logging_obj is not None else None,
+        ):
+            if is_pending_background_response(completion_response):
+                return 0.0
+            request_pricing_model: Final = model or _get_response_model(completion_response)
+            return flat_request_cost(
+                price=request_price,
+                model=request_pricing_model,
+                custom_llm_provider=custom_llm_provider,
+                region_name=region_name if isinstance(region_name, str) else None,
+                logging_obj=litellm_logging_obj,
+            )
 
         if call_type == CallTypes.aresponses_websocket.value and isinstance(
             completion_response, LiteLLMRealtimeStreamLoggingObject

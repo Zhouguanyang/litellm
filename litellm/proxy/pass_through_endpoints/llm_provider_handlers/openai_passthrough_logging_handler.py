@@ -468,6 +468,9 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             model=model,
             custom_llm_provider=custom_llm_provider,
             call_type="responses",
+            custom_pricing=logging_obj.request_price_for(litellm_model_response) is not None,
+            router_model_id=logging_obj.get_router_model_id(),
+            litellm_logging_obj=logging_obj,
         )
         return litellm_model_response, response_cost
 
@@ -578,6 +581,9 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     completion_response=litellm_model_response,
                     model=model,
                     custom_llm_provider=custom_llm_provider,
+                    custom_pricing=logging_obj.request_price_for(litellm_model_response) is not None,
+                    router_model_id=logging_obj.get_router_model_id(),
+                    litellm_logging_obj=logging_obj,
                 )
             elif is_embeddings:
                 litellm_model_response = convert_to_model_response_object(
@@ -591,35 +597,31 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     custom_llm_provider=custom_llm_provider,
                 )
                 set_hidden_param(litellm_model_response, "response_cost", response_cost)
-            elif is_image_generation:
-                # Handle image generation cost calculation
-                response_cost = OpenAIPassthroughLoggingHandler._calculate_image_generation_cost(
-                    model=model,
-                    response_body=response_body,
-                    request_body=request_body,
-                )
-                logging_obj.call_type = PassthroughCallTypes.passthrough_image_generation.value
-                # Create a simple response object for logging
+            elif is_image_generation or is_image_editing:
                 litellm_model_response = ImageResponse(
                     data=response_body.get("data", []),
                     model=model,
                 )
-                # Set the calculated cost in _hidden_params to prevent recalculation
-                set_hidden_param(litellm_model_response, "response_cost", response_cost)
-            elif is_image_editing:
-                # Handle image editing cost calculation
-                response_cost = OpenAIPassthroughLoggingHandler._calculate_image_editing_cost(
-                    model=model,
-                    response_body=response_body,
-                    request_body=request_body,
+                response_cost = (
+                    litellm.completion_cost(
+                        completion_response=litellm_model_response,
+                        model=model,
+                        call_type="image_generation" if is_image_generation else "image_edit",
+                        custom_llm_provider=custom_llm_provider,
+                        custom_pricing=True,
+                        router_model_id=logging_obj.get_router_model_id(),
+                        litellm_logging_obj=logging_obj,
+                    )
+                    if logging_obj.request_price_for(litellm_model_response) is not None
+                    else OpenAIPassthroughLoggingHandler._calculate_image_generation_cost(
+                        model=model, response_body=response_body, request_body=request_body,
+                    )
+                    if is_image_generation
+                    else OpenAIPassthroughLoggingHandler._calculate_image_editing_cost(
+                        model=model, response_body=response_body, request_body=request_body,
+                    )
                 )
                 logging_obj.call_type = PassthroughCallTypes.passthrough_image_generation.value
-                # Create a simple response object for logging
-                litellm_model_response = ImageResponse(
-                    data=response_body.get("data", []),
-                    model=model,
-                )
-                # Set the calculated cost in _hidden_params to prevent recalculation
                 set_hidden_param(litellm_model_response, "response_cost", response_cost)
             elif is_responses:
                 # Responses-API cost tracking — see
@@ -778,6 +780,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             complete_streaming_response: Final = litellm.stream_chunk_builder(
                 chunks=all_openai_chunks,
                 messages=messages,
+                logging_obj=litellm_logging_obj,
                 count_prompt_tokens=lambda: count_relayed_prompt_tokens(model, messages),
             )
 
@@ -846,6 +849,9 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     completion_response=complete_response,
                     model=model,
                     custom_llm_provider=custom_llm_provider,
+                    custom_pricing=litellm_logging_obj.request_price_for(complete_response) is not None,
+                    router_model_id=litellm_logging_obj.get_router_model_id(),
+                    litellm_logging_obj=litellm_logging_obj,
                     call_type="responses",
                 )
                 if is_responses
@@ -853,6 +859,9 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                     completion_response=complete_response,
                     model=model,
                     custom_llm_provider=custom_llm_provider,
+                    custom_pricing=litellm_logging_obj.request_price_for(complete_response) is not None,
+                    router_model_id=litellm_logging_obj.get_router_model_id(),
+                    litellm_logging_obj=litellm_logging_obj,
                 )
             )
 
