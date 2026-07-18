@@ -232,6 +232,51 @@ def test_gemini_image_generation_cost_uses_output_token_details(monkeypatch):
     assert cost != all_output_as_image_cost
 
 
+def test_gemini_image_generation_cost_can_force_flat_image_pricing(monkeypatch):
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    litellm.model_cost = {**litellm.get_model_cost_map(url="")}
+    base_model = "gemini/gemini-3-pro-image-preview"
+    model = "gemini-force-flat-image-test"
+    model_info = litellm.get_model_info(
+        model=base_model,
+        custom_llm_provider="gemini",
+    )
+    forced_cost_per_image = 0.02
+    litellm.model_cost[f"gemini/{model}"] = {
+        **model_info,
+        "output_cost_per_image": forced_cost_per_image,
+        "force_output_cost_per_image": True,
+    }
+    litellm.get_model_info.cache_clear()
+
+    input_tokens = 3279
+    output_tokens = 1423
+    image_response = ImageResponse(
+        data=[ImageObject(b64_json="img1"), ImageObject(b64_json="img2")],
+        usage=ImageUsage(
+            input_tokens=input_tokens,
+            input_tokens_details=ImageUsageInputTokensDetails(
+                text_tokens=input_tokens,
+                image_tokens=0,
+            ),
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        ),
+    )
+
+    cost = gemini_image_generation_cost_calculator(
+        model=model,
+        image_response=image_response,
+    )
+
+    token_based_cost = (
+        input_tokens * model_info["input_cost_per_token"]
+        + output_tokens * model_info["output_cost_per_image_token"]
+    )
+    assert cost == pytest.approx(forced_cost_per_image * len(image_response.data or []))
+    assert round(cost, 10) != round(token_based_cost, 10)
+
+
 def test_gemini_image_edit_cost_falls_back_to_flat_image_pricing(monkeypatch):
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
     litellm.model_cost = litellm.get_model_cost_map(url="")
