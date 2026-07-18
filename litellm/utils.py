@@ -5469,6 +5469,7 @@ def _get_model_info_helper(
                 output_cost_per_character_above_128k_tokens=_model_info.get(
                     "output_cost_per_character_above_128k_tokens", None
                 ),
+                output_cost_per_request=_model_info.get("output_cost_per_request", None),
                 output_cost_per_token_above_200k_tokens=_model_info.get(
                     "output_cost_per_token_above_200k_tokens", None
                 ),
@@ -5490,6 +5491,7 @@ def _get_model_info_helper(
                 output_cost_per_image=_model_info.get("output_cost_per_image", None),
                 output_cost_per_image_token=_model_info.get("output_cost_per_image_token", None),
                 output_cost_per_video_token=_model_info.get("output_cost_per_video_token", None),
+                force_output_cost_per_image=_model_info.get("force_output_cost_per_image", None),
                 output_vector_size=_model_info.get("output_vector_size", None),
                 citation_cost_per_token=_model_info.get("citation_cost_per_token", None),
                 tiered_pricing=_model_info.get("tiered_pricing", None),
