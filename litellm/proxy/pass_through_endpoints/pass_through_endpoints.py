@@ -1927,6 +1927,7 @@ def create_pass_through_route(
                 "forward_headers": _forward_headers,
                 "merge_query_params": _merge_query_params,
                 "cost_per_request": cost_per_request,
+                "custom_llm_provider": custom_llm_provider,
                 "guardrails": None,
                 "timeout": timeout,
             }
@@ -1940,6 +1941,7 @@ def create_pass_through_route(
             param_forward_headers: Final = target_params.get("forward_headers", _forward_headers)
             param_merge_query_params: Final = target_params.get("merge_query_params", _merge_query_params)
             param_cost_per_request: Final = target_params.get("cost_per_request", cost_per_request)
+            param_custom_llm_provider: Final = target_params.get("custom_llm_provider", custom_llm_provider)
             param_guardrails: Final = target_params.get("guardrails", None)
             param_default_query_params: Final = target_params.get("default_query_params", None)
             param_timeout: Final = target_params.get("timeout", timeout)
@@ -1988,7 +1990,7 @@ def create_pass_through_route(
                         stream=is_stream,
                         custom_body=final_custom_body,
                         cost_per_request=cast(float | None, param_cost_per_request),
-                        custom_llm_provider=custom_llm_provider,
+                        custom_llm_provider=cast(str | None, param_custom_llm_provider),
                         guardrails_config=cast(dict | None, param_guardrails),
                         timeout=cast(float | None, param_timeout),
                     )
@@ -2810,6 +2812,7 @@ class InitPassThroughEndpointHelpers:
         config_file_path: str | None = None,
         auth: bool = False,
         timeout: float | None = None,
+        custom_llm_provider: str | None = None,
     ):
         """Add exact path route for pass-through endpoint"""
         # Default to all methods if none specified (backward compatibility)
@@ -2847,6 +2850,7 @@ class InitPassThroughEndpointHelpers:
                 merge_query_params,
                 dependencies,
                 cost_per_request=cost_per_request,
+                custom_llm_provider=custom_llm_provider,
                 default_query_params=default_query_params,
                 guardrails=guardrails,
                 config_file_path=config_file_path,
@@ -2871,6 +2875,7 @@ class InitPassThroughEndpointHelpers:
                 "default_query_params": default_query_params,
                 "dependencies": dependencies,
                 "cost_per_request": cost_per_request,
+                "custom_llm_provider": custom_llm_provider,
                 "guardrails": guardrails,
                 "timeout": timeout,
             },
@@ -2893,6 +2898,7 @@ class InitPassThroughEndpointHelpers:
         config_file_path: str | None = None,
         auth: bool = False,
         timeout: float | None = None,
+        custom_llm_provider: str | None = None,
     ):
         """Add wildcard route for sub-paths"""
         # Default to all methods if none specified (backward compatibility)
@@ -2931,6 +2937,7 @@ class InitPassThroughEndpointHelpers:
                 dependencies,
                 include_subpath=True,
                 cost_per_request=cost_per_request,
+                custom_llm_provider=custom_llm_provider,
                 default_query_params=default_query_params,
                 guardrails=guardrails,
                 config_file_path=config_file_path,
@@ -2955,6 +2962,7 @@ class InitPassThroughEndpointHelpers:
                 "default_query_params": default_query_params,
                 "dependencies": dependencies,
                 "cost_per_request": cost_per_request,
+                "custom_llm_provider": custom_llm_provider,
                 "guardrails": guardrails,
                 "timeout": timeout,
             },
@@ -3130,6 +3138,7 @@ async def _register_pass_through_endpoint(
     guardrails: Final = endpoint_data.get("guardrails")
     methods: Final = endpoint_data.get("methods")
     cost_per_request: Final = endpoint_data.get("cost_per_request")
+    custom_llm_provider: Final = endpoint_data.get("custom_llm_provider")
     timeout: Final = endpoint_data.get("timeout")
 
     verbose_proxy_logger.debug("Initializing pass through endpoint: %s (ID: %s)", path, endpoint_id)
@@ -3149,6 +3158,7 @@ async def _register_pass_through_endpoint(
         config_file_path=config_file_path,
         auth=auth_enforced,
         timeout=timeout,
+        custom_llm_provider=custom_llm_provider,
     )
 
     methods_for_key: Final = methods if methods else ["GET", "POST", "PUT", "DELETE", "PATCH"]
@@ -3176,6 +3186,7 @@ async def _register_pass_through_endpoint(
             config_file_path=config_file_path,
             auth=auth_enforced,
             timeout=timeout,
+            custom_llm_provider=custom_llm_provider,
         )
         visited_endpoints.add(f"{endpoint_id}:subpath:{path}:{methods_str}")
 
@@ -3561,6 +3572,7 @@ async def update_pass_through_endpoints(
             default_query_params=updated_endpoint.default_query_params,
             auth=updated_endpoint.auth,
             timeout=updated_endpoint.timeout,
+            custom_llm_provider=updated_endpoint.custom_llm_provider,
         )
     else:
         InitPassThroughEndpointHelpers.add_exact_path_route(
@@ -3578,6 +3590,7 @@ async def update_pass_through_endpoints(
             default_query_params=updated_endpoint.default_query_params,
             auth=updated_endpoint.auth,
             timeout=updated_endpoint.timeout,
+            custom_llm_provider=updated_endpoint.custom_llm_provider,
         )
 
     return PassThroughEndpointResponse(endpoints=[updated_endpoint] if updated_endpoint else [])
@@ -3653,6 +3666,7 @@ async def create_pass_through_endpoints(
             default_query_params=created_endpoint.default_query_params,
             auth=created_endpoint.auth,
             timeout=created_endpoint.timeout,
+            custom_llm_provider=created_endpoint.custom_llm_provider,
         )
     else:
         InitPassThroughEndpointHelpers.add_exact_path_route(
@@ -3670,6 +3684,7 @@ async def create_pass_through_endpoints(
             default_query_params=created_endpoint.default_query_params,
             auth=created_endpoint.auth,
             timeout=created_endpoint.timeout,
+            custom_llm_provider=created_endpoint.custom_llm_provider,
         )
 
     return PassThroughEndpointResponse(endpoints=[created_endpoint])
