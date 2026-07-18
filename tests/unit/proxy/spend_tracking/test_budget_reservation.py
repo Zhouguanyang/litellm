@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Final
 
+import httpx
 import pytest
+import respx
 
 import litellm
 from litellm.caching import DualCache
@@ -25,14 +28,319 @@ from litellm.proxy.common_utils.user_api_key_cache import (
 )
 from litellm.proxy.spend_tracking.budget_reservation import (
     _get_team_member_budget_counter,
+    estimate_request_input_cost,
     estimate_request_max_cost,
     get_budget_window_start,
+    reconcile_budget_reservation,
     release_unbound_budget_reservation,
     reserve_budget_for_request,
 )
 from litellm.proxy.utils import ProxyLogging
 from litellm.router import Router
 from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo
+
+
+@pytest.mark.parametrize("token_rate", (None, 0.0, 0.001))
+@pytest.mark.parametrize("request_price", (0.0, 0.02))
+@pytest.mark.parametrize("price_source", ("model_info", "litellm_params", "both"))
+@pytest.mark.parametrize(
+    "route", ("/chat/completions", "/v1/images/generations", "/v1beta/models/priced:generateContent")
+)
+def test_configured_request_price_reservations_match_charges(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch,
+    token_rate: float | None, request_price: float, route: str, price_source: str,
+) -> None:
+    model: Final = "openai/unit-reserved-request-price"
+    discount: Final = 0.25
+    margin: Final = 0.5
+    fixed_margin: Final = 0.003
+    monkeypatch.setattr(litellm, "cost_discount_config", {model: discount})
+    monkeypatch.setattr(litellm, "cost_margin_config", {"openai": {
+        "percentage": margin, "fixed_amount": fixed_margin,
+    }})
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+    }})
+    router: Final = Router(model_list=[{
+        "model_name": "priced", "litellm_params": {
+            "model": model, "api_key": "unused",
+            **({"output_cost_per_request": request_price} if price_source != "model_info" else {}),
+        },
+        "model_info": {
+            "id": "reserved-request-price",
+            **({"output_cost_per_request": request_price + (0.01 if price_source == "both" else 0.0)}
+               if price_source != "litellm_params" else {}),
+            **({"input_cost_per_token": token_rate, "output_cost_per_token": token_rate}
+               if token_rate is not None else {}),
+        },
+    }])
+    body: Final = {"model": "priced", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 20, "n": 3}
+    expected: Final = request_price * (1 - discount) * (1 + margin) + fixed_margin
+    assert litellm.completion_cost(
+        completion_response=litellm.ModelResponse(
+            model=model, usage=litellm.Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+        ),
+        model=model, custom_llm_provider="openai", custom_pricing=True, router_model_id="reserved-request-price",
+    ) == pytest.approx(expected)
+    assert estimate_request_max_cost(
+        request_body=body, route=route, llm_router=router, input_token_counts={"priced": 10},
+    ) == pytest.approx(expected)
+    assert estimate_request_input_cost(
+        request_body=body, route=route, llm_router=router, input_token_counts={"priced": 10},
+    ) == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("price_source", ("model_info", "litellm_params"))
+@pytest.mark.parametrize("route", (
+    "/chat/completions", "/openai/v1/chat/completions", "/openai_passthrough/v1/chat/completions",
+    "/vllm/v1/chat/completions", "/openai/v1/images/generations", "/anthropic/v1/messages",
+    "/gemini/v1beta/models/priced:generateContent",
+    "/gemini/v1alpha/models/priced:streamGenerateContent",
+    "/vertex-ai/v1/projects/p/locations/us/publishers/google/models/priced:generateContent",
+    "/vertex_ai/v1/projects/p/locations/us/publishers/anthropic/models/priced:rawPredict",
+    "/vertex-ai/v1/projects/p/locations/us/publishers/anthropic/models/priced:streamRawPredict",
+    "/bedrock/model/priced/converse", "/bedrock/model/priced/converse-stream",
+    "/bedrock/model/priced/invoke", "/bedrock/model/priced/invoke-with-response-stream",
+    "/cohere/v2/chat",
+    "/azure/openai/deployments/priced/chat/completions?api-version=unit",
+    "/azure/openai/responses", "/azure/openai/v1/responses",
+    "/azure/openai/deployments/priced/responses", "/azure/priced/openai/responses",
+    "/azure/priced/responses", "/azure_ai/openai/responses", "/azure_ai/priced/openai/v1/responses",
+    "/azure_ai/models/chat/completions", "/azure_ai/priced/models/chat/completions",
+))
+async def test_flat_fee_reservations_block_concurrent_requests_and_reconcile_actual_cost(
+    local_model_cost_map: None, spend_counter_cache: DualCache, price_source: str, route: str,
+) -> None:
+    model: Final = "openai/unit-flat-fee-concurrency"
+    price: Final = 0.02
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 0.0, "output_cost_per_token": 0.0,
+    }})
+    router: Final = Router(model_list=[{
+        "model_name": "priced", "litellm_params": {
+            "model": model, "api_key": "unused",
+            **({"output_cost_per_request": price} if price_source == "litellm_params" else {}),
+        },
+        "model_info": {
+            "id": "reserved-flat-concurrency",
+            **({"output_cost_per_request": price} if price_source == "model_info" else {}),
+        },
+    }])
+    key_cache: Final = UserApiKeyCache()
+    token: Final = UserAPIKeyAuth(token="flat-fee-concurrency", max_budget=price, spend=0.0)
+    requests: Final = await asyncio.gather(*(
+        reserve_budget_for_request(
+            request_body={"model": "priced", "messages": [{"role": "user", "content": "hello"}]},
+            route=route, llm_router=router, valid_token=token,
+            team_object=None, user_object=None, prisma_client=None, user_api_key_cache=key_cache,
+            proxy_logging_obj=ProxyLogging(user_api_key_cache=key_cache),
+        ) for _ in range(3)
+    ), return_exceptions=True)
+    reservations: Final = tuple(result for result in requests if isinstance(result, dict))
+    rejected: Final = tuple(result for result in requests if isinstance(result, litellm.BudgetExceededError))
+    assert len(reservations) == 1, requests
+    assert len(rejected) == 2, requests
+    assert reservations[0]["reserved_cost"] == pytest.approx(price)
+    counter_key: Final = "spend:key:flat-fee-concurrency"
+    assert spend_counter_cache.in_memory_cache.get_cache(key=counter_key) == pytest.approx(price)
+    actual_fallback_cost: Final = price / 2
+    await reconcile_budget_reservation(reservations[0], actual_cost=actual_fallback_cost)
+    assert spend_counter_cache.in_memory_cache.get_cache(key=counter_key) == pytest.approx(actual_fallback_cost)
+
+
+@pytest.mark.parametrize("mixed", (False, True))
+def test_request_price_reservations_keep_the_most_expensive_deployment(
+    local_model_cost_map: None, mixed: bool,
+) -> None:
+    model: Final = "openai/unit-mixed-reservations"
+    input_rate: Final = 0.001
+    output_rate: Final = 0.002
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "chat",
+        "input_cost_per_token": input_rate, "output_cost_per_token": output_rate,
+    }})
+    router: Final = Router(model_list=[{
+        "model_name": "priced", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {
+            "id": f"mixed-reservation-{index}",
+            **({"output_cost_per_request": price} if price is not None else {}),
+        },
+    } for index, price in enumerate((0.0, 0.02, None) if mixed else (0.0, 0.02))])
+    body: Final = {"model": "priced", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 20}
+    token_cost: Final = 10 * input_rate + 20 * output_rate
+    assert estimate_request_max_cost(
+        request_body=body, route="/chat/completions", llm_router=router, input_token_counts={"priced": 10},
+    ) == pytest.approx(max(0.02, token_cost) if mixed else 0.02)
+
+
+@pytest.mark.parametrize("route", (
+    "/v1/embeddings", "/v1/realtime", "/openai/v1/embeddings", "/openai/v1/realtime",
+    "/openai_passthrough/v1/embeddings", "/openai_passthrough/v1/realtime",
+    "/openaifake/v1/chat/completions",
+    "/azure/openai/embeddings", "/azure/openai/deployments/priced/embeddings",
+    "/azure_ai/priced/openai/v1/embeddings", "/azure_ai/priced/models/embeddings",
+))
+@pytest.mark.parametrize("request_price", (0.0, 0.02))
+def test_request_prices_do_not_replace_usage_reservations_on_other_routes(
+    local_model_cost_map: None, route: str, request_price: float,
+) -> None:
+    model: Final = "openai/unit-usage-reservation"
+    input_rate: Final = 0.001
+    output_rate: Final = 0.002
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "embedding" if route.endswith("/embeddings") else "chat",
+        "input_cost_per_token": input_rate, "output_cost_per_token": output_rate,
+    }})
+    router: Final = Router(model_list=[{
+        "model_name": "priced", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {"id": "usage-reservation", "output_cost_per_request": request_price},
+    }])
+    body: Final = {"model": "priced", "input": "hello", "max_tokens": 20}
+    assert estimate_request_max_cost(
+        request_body=body, route=route, llm_router=router, input_token_counts={"priced": 10},
+    ) == pytest.approx(10 * input_rate + (0.0 if route.endswith("/embeddings") else 20 * output_rate))
+    assert estimate_request_input_cost(
+        request_body=body, route=route, llm_router=router, input_token_counts={"priced": 10},
+    ) == pytest.approx(10 * input_rate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tiered", (False, True))
+@pytest.mark.parametrize("price_source", ("model_info", "litellm_params"))
+@pytest.mark.parametrize("price", (0.0, 0.02, 0.08))
+async def test_mixed_group_reserves_only_costs_its_deployments_can_charge(
+    local_model_cost_map: None, spend_counter_cache: DualCache, tiered: bool, price_source: str, price: float,
+) -> None:
+    rates: Final = (("flat", 0.1, 0.2), ("tokens", 0.001, 0.002), ("input", 0.004, 0.0))
+    for name, input_rate, output_rate in rates:
+        litellm.register_model({f"openai/unit-mixed-{name}": {
+            "litellm_provider": "openai", "mode": "chat",
+            "input_cost_per_token": input_rate, "output_cost_per_token": output_rate,
+        }})
+    router: Final = Router(model_list=[{
+        "model_name": "priced", "litellm_params": {
+            "model": f"openai/unit-mixed-{name}", "api_key": "unused",
+            **({"output_cost_per_request": price} if name == "flat" and price_source == "litellm_params" else {}),
+        },
+        "model_info": {
+            "id": f"mixed-actual-price-{name}",
+            **({"output_cost_per_request": price} if name == "flat" and price_source == "model_info" else {}),
+            **({"tiered_pricing": [{
+                "range": [0, 1000], "input_cost_per_token": input_rate, "output_cost_per_token": output_rate,
+            }]} if tiered and name != "flat" else {}),
+        },
+    } for name, input_rate, output_rate in rates])
+    body: Final = {"model": "priced", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 20}
+    response: Final = litellm.ModelResponse(usage=litellm.Usage(
+        prompt_tokens=10, completion_tokens=20, total_tokens=30,
+    ))
+    charges: Final = tuple(litellm.completion_cost(
+        completion_response=response, model=f"openai/unit-mixed-{name}", custom_llm_provider="openai",
+        custom_pricing=True, router_model_id=f"mixed-actual-price-{name}",
+    ) for name, _, _ in rates)
+    expected: Final = max(price, 10 * 0.001 + 20 * 0.002, 10 * 0.004)
+    assert charges == pytest.approx((price, 0.05, 0.04))
+    assert estimate_request_max_cost(
+        request_body=body, route="/chat/completions", llm_router=router, input_token_counts={"priced": 10},
+    ) == pytest.approx(expected)
+    assert estimate_request_input_cost(
+        request_body=body, route="/chat/completions", llm_router=router, input_token_counts={"priced": 10},
+    ) == pytest.approx(10 * 0.004)
+    cache: Final = UserApiKeyCache()
+    reservation: Final = await reserve_budget_for_request(
+        request_body=body, route="/chat/completions", llm_router=router,
+        valid_token=UserAPIKeyAuth(token="mixed-actual-prices", max_budget=expected, spend=0.0),
+        team_object=None, user_object=None, prisma_client=None, user_api_key_cache=cache,
+        proxy_logging_obj=ProxyLogging(user_api_key_cache=cache), fail_closed_budget_enforcement=True,
+    )
+    assert reservation is not None
+    assert reservation["reserved_cost"] <= expected
+    assert spend_counter_cache.in_memory_cache.get_cache(key="spend:key:mixed-actual-prices") == pytest.approx(
+        reservation["reserved_cost"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias_style", ("string", "object", "chain"))
+@pytest.mark.parametrize("pricing", ("flat", "token", "mixed"))
+async def test_request_price_reservations_follow_the_alias_target_once(
+    local_model_cost_map: None, spend_counter_cache: DualCache, respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch, alias_style: str, pricing: str,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    model: Final = "openai/unit-budget-alias"
+    price: Final = 0.02
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 0.001,
+        "output_cost_per_token": 0.002,
+    }})
+    target_prices: Final = (price, None) if pricing == "mixed" else (None,) if pricing == "token" else (price,)
+    router: Final = Router(model_list=[{
+        "model_name": group, "litellm_params": {
+            "model": model, "api_key": "unused", "api_base": "https://budget-alias.unit/v1",
+        },
+        "model_info": {
+            "id": f"budget-alias-{index}", **({"output_cost_per_request": fee} if fee is not None else {}),
+        },
+    } for index, (group, fee) in enumerate((
+        ("requested", 0.9), ("distant", 0.7), *(("served", fee) for fee in target_prices),
+    ))], model_group_alias={
+        "requested": {"model": "served", "hidden": False} if alias_style == "object" else "served",
+        **({"served": "distant"} if alias_style == "chain" else {}),
+    }, num_retries=0)
+    body: Final = {"model": "requested", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 20}
+    expected: Final = 0.05 if pricing != "flat" else price
+    assert estimate_request_max_cost(
+        request_body=body, route="/chat/completions", llm_router=router, input_token_counts={"requested": 10},
+    ) == pytest.approx(expected)
+    assert estimate_request_input_cost(
+        request_body=body, route="/chat/completions", llm_router=router, input_token_counts={"requested": 10},
+    ) == pytest.approx(0.01 if pricing != "flat" else 0.0)
+    cache: Final = UserApiKeyCache()
+    reservation: Final = await reserve_budget_for_request(
+        request_body=body, route="/chat/completions", llm_router=router,
+        valid_token=UserAPIKeyAuth(token="budget-alias", max_budget=expected, spend=0.0),
+        team_object=None, user_object=None, prisma_client=None, user_api_key_cache=cache,
+        proxy_logging_obj=ProxyLogging(user_api_key_cache=cache), fail_closed_budget_enforcement=True,
+    )
+    assert reservation is not None
+    upstream: Final = respx_mock.post("https://budget-alias.unit/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json={
+            "id": "chatcmpl_alias", "object": "chat.completion", "model": model, "created": 1,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        }),
+    )
+    response: Final = await router.acompletion(model="requested", messages=body["messages"])
+    assert isinstance(response, litellm.ModelResponse)
+    charged: Final = litellm.completion_cost(
+        completion_response=response, model=model, custom_llm_provider="openai", custom_pricing=True,
+        router_model_id=response._hidden_params["model_id"],
+    )
+    assert upstream.call_count == 1
+    allowed_costs: Final = (price, 0.05) if pricing == "mixed" else (expected,)
+    assert any(charged == pytest.approx(cost) for cost in allowed_costs)
+    assert charged <= expected
+
+
+def test_request_price_reservation_keeps_explicit_provider_cost_adjustments(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model: Final = "unit-explicit-provider-reservation"
+    request_price: Final = 0.02
+    margin: Final = 0.003
+    monkeypatch.setattr(litellm, "cost_margin_config", {"openai": {"fixed_amount": margin}})
+    router: Final = Router(model_list=[{
+        "model_name": "priced",
+        "litellm_params": {"model": model, "api_key": "unused", "custom_llm_provider": "openai"},
+        "model_info": {"id": "explicit-provider-reservation", "output_cost_per_request": request_price},
+    }])
+    assert estimate_request_max_cost(
+        request_body={"model": "priced", "messages": [{"role": "user", "content": "hello"}]},
+        route="/chat/completions", llm_router=router,
+    ) == pytest.approx(request_price + margin)
 
 TOKEN_COUNTING_ROUTES: Final = (
     "/responses/input_tokens",

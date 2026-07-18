@@ -6,11 +6,14 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+import litellm
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.vertex_passthrough_logging_handler import (
     VertexPassthroughLoggingHandler,
 )
+from litellm.proxy.pass_through_endpoints.success_handler import PassThroughEndpointLogging
+from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 from litellm.types.utils import EmbeddingResponse, ModelResponse
 
 _PREDICT_ROUTE = "/v1/projects/p/locations/us-central1/publishers/google/models/text-embedding-004:predict"
@@ -127,3 +130,92 @@ def test_build_complete_streaming_response_assembles_stream_generate_content_sse
     assert response.choices[0].message.content == "Hello there!"
     assert response.choices[0].finish_reason == "stop"
     assert (response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens) == (10, 8, 18)
+
+
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("metadata_key", ("metadata", "litellm_metadata"))
+@pytest.mark.parametrize("backup_rate", (None, 0.0, 0.02))
+def test_vertex_passthrough_prices_the_successful_deployment(
+    local_model_cost_map: None,
+    stream: bool,
+    metadata_key: str,
+    backup_rate: float | None,
+) -> None:
+    model: Final = "vertex-fallback-pricing-test"
+    litellm.register_model(
+        {
+            f"vertex_ai/{model}": {
+                "litellm_provider": "vertex_ai",
+                "mode": "chat",
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            }
+        }
+    )
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": f"vertex_ai/{model}"},
+                "model_info": {"id": "primary", "output_cost_per_request": 0.01},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {"model": f"vertex_ai/{model}"},
+                "model_info": {
+                    "id": "backup",
+                    **({"output_cost_per_request": backup_rate} if backup_rate is not None else {}),
+                },
+            },
+        ]
+    )
+    now: Final = datetime(2026, 1, 1)
+    logging_obj: Final = Logging(
+        model=model,
+        messages=[],
+        stream=stream,
+        call_type="pass_through_endpoint",
+        start_time=now,
+        litellm_call_id="fallback-pricing",
+        function_id="fallback-pricing",
+    )
+    logging_obj.update_environment_variables(
+        optional_params={},
+        litellm_params={metadata_key: {"model_info": router.model_list[1]["model_info"]}},
+    )
+    logging_obj.model_call_details["custom_llm_provider"] = "vertex_ai"
+    body: Final = {
+        "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP", "index": 0}],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30},
+    }
+    route: Final = (
+        "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models/"
+        f"{model}:generateContent"
+    )
+    result: Final = (
+        VertexPassthroughLoggingHandler.handle_logging_vertex_collected_chunks(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route=route.replace(":generateContent", ":streamGenerateContent"),
+            request_body={},
+            endpoint_type=EndpointType.VERTEX_AI,
+            start_time=now,
+            end_time=now,
+            all_chunks=[f"data: {json.dumps(body)}\n\n"],
+            model=model,
+        )
+        if stream
+        else VertexPassthroughLoggingHandler.vertex_passthrough_handler(
+            httpx_response=httpx.Response(200, json=body),
+            logging_obj=logging_obj,
+            url_route=route,
+            result="",
+            start_time=now,
+            end_time=now,
+            cache_hit=False,
+            request_body={},
+        )
+    )
+    expected: Final = backup_rate if backup_rate is not None else 10 * 0.001 + 20 * 0.002
+
+    assert result["kwargs"]["response_cost"] == pytest.approx(expected)

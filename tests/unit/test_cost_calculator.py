@@ -10174,3 +10174,468 @@ def test_bedrock_registered_cache_prices_preserve_dynamic_threshold_rates(
     assert entry is not None
     assert entry[1]["input_cost_per_token_above_300k_tokens"] == 0.03
     assert entry[1][tier_field] == (tier_override if tier_override is not None else 0.007)
+
+
+@pytest.mark.parametrize("provider", ("openai", "anthropic", "gemini", "vertex_ai", "deepseek", "openrouter"))
+@pytest.mark.parametrize("backup_pricing", ("published", "request", "free", "token"))
+@pytest.mark.usefixtures("local_model_cost_map")
+def test_response_cost_uses_selected_deployment(
+    provider: str,
+    backup_pricing: Literal["published", "request", "free", "token"],
+) -> None:
+    model: Final = f"{provider}/fallback-pricing-test"
+    rates: Final = {
+        "published": {},
+        "request": {"output_cost_per_request": 0.02},
+        "free": {"output_cost_per_request": 0.0},
+        "token": {"input_cost_per_token": 0.003, "output_cost_per_token": 0.004},
+    }
+    litellm.register_model(
+        {
+            model: {
+                "litellm_provider": provider,
+                "mode": "chat",
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            }
+        }
+    )
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": model, "api_key": "unused"},
+                "model_info": {"id": "primary", "output_cost_per_request": 0.01},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {"model": model, "api_key": "unused"},
+                "model_info": {"id": "backup", **rates[backup_pricing]},
+            },
+        ],
+        fallbacks=[{"primary": ["backup"]}],
+        num_retries=0,
+        disable_cooldowns=True,
+    )
+
+    response: Final = ModelResponse(
+        model=model,
+        choices=[{"message": {"role": "assistant", "content": "ok"}}],
+        usage=Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30),
+    )
+    logging_obj: Final = Logging(
+        model=model,
+        messages=[],
+        stream=False,
+        call_type="completion",
+        start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="pricing",
+        function_id="pricing",
+    )
+    logging_obj.update_environment_variables(
+        optional_params={},
+        litellm_params={"metadata": {"model_info": router.model_list[1]["model_info"]}},
+    )
+    logging_obj.model_call_details["custom_llm_provider"] = provider
+    cost: Final = logging_obj.response_cost_calculator(response)
+    expected: Final = (
+        (response.usage.prompt_tokens * 0.001 + response.usage.completion_tokens * 0.002)
+        if backup_pricing == "published"
+        else (response.usage.prompt_tokens * 0.003 + response.usage.completion_tokens * 0.004)
+        if backup_pricing == "token"
+        else rates[backup_pricing]["output_cost_per_request"]
+    )
+
+    assert logging_obj.get_router_model_id() == "backup"
+    assert cost == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("provider", ("gemini", "openai"))
+@pytest.mark.parametrize("request_price", (0.0, 0.02))
+@pytest.mark.parametrize("with_usage", (False, True))
+def test_configured_image_request_price_is_fixed_and_keeps_cost_adjustments(
+    local_model_cost_map: None,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    request_price: float,
+    with_usage: bool,
+) -> None:
+    from litellm.proxy.common_request_processing import cost_headers
+
+    model: Final = f"{provider}/unit-configured-image-request"
+    deployment_id: Final = "unit-configured-image-request-id"
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "configured-image",
+        "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {"id": deployment_id, "output_cost_per_request": request_price, "mode": "image_generation"},
+    }])
+    monkeypatch.setattr(litellm, "cost_margin_config", {provider: 0.5})
+    monkeypatch.setattr(litellm, "cost_discount_config", {provider: 0.25})
+    logger: Final = Logging(
+        model=model, messages=[], stream=False, call_type="image_generation",
+        start_time=datetime.datetime(2026, 1, 1), litellm_call_id="flat-image", function_id="flat-image",
+    )
+    logger.update_environment_variables(
+        optional_params={}, litellm_params={"metadata": {"model_info": router.model_list[0]["model_info"]}},
+    )
+    response: Final = ImageResponse(
+        data=[ImageObject(b64_json="aW1hZ2U=")],
+        usage=ImageUsage(
+            input_tokens=10, output_tokens=20, total_tokens=30,
+            input_tokens_details=ImageUsageInputTokensDetails(text_tokens=10, image_tokens=0),
+        ) if with_usage else None,
+    )
+    cost: Final = logger.response_cost_calculator(response)
+    assert cost == pytest.approx(request_price * 0.75 * 1.5)
+    assert logger.cost_breakdown is not None
+    assert logger.cost_breakdown["original_cost"] == pytest.approx(request_price)
+    headers: Final = cost_headers(cost, logger)
+    assert float(headers["x-litellm-response-cost-input"]) == 0.0
+    assert float(headers["x-litellm-response-cost-output"]) == pytest.approx(request_price)
+
+
+@pytest.mark.parametrize(
+    "call_type", ("embedding", "aembedding", "pass_through_endpoint", CallTypes.aresponses_websocket.value)
+)
+@pytest.mark.parametrize("request_price", (None, 0.0, 0.02))
+@pytest.mark.parametrize("token_override", (False, True))
+@pytest.mark.parametrize("cached_cost", (None, 0.123))
+def test_request_prices_preserve_usage_billing_on_other_call_types(
+    local_model_cost_map: None, call_type: str, request_price: float | None, token_override: bool,
+    cached_cost: float | None,
+) -> None:
+    model: Final = "openai/unit-request-price-token-billing"
+    input_rate: Final = 0.001
+    output_rate: Final = 0.002
+    litellm.register_model({model: {
+        "litellm_provider": "openai",
+        "mode": "chat" if call_type == CallTypes.aresponses_websocket.value else "embedding",
+        "input_cost_per_token": input_rate, "output_cost_per_token": output_rate,
+    }})
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "request-priced", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {
+            "id": "deployment-usage-pricing",
+            **({"output_cost_per_request": request_price} if request_price is not None else {}),
+            **({"input_cost_per_token": input_rate * 3, "output_cost_per_token": output_rate * 3}
+               if token_override else {}),
+        },
+    }])
+    logger: Final = Logging(
+        model=model, messages=[], stream=False, call_type=call_type, start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="request-price-other-call", function_id="request-price-other-call",
+    )
+    logger.update_environment_variables(optional_params={}, litellm_params={
+        "custom_llm_provider": "openai", "metadata": {"model_info": router.model_list[0]["model_info"]},
+    }, custom_llm_provider="openai")
+    result: Final = (
+        logger.normalize_logging_result([
+            {"type": "response.completed", "response": {
+                "service_tier": tier, "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
+            }} for tier in ("default", "priority")
+        ]) if call_type == CallTypes.aresponses_websocket.value else EmbeddingResponse(
+            model=model, data=[], usage=Usage(prompt_tokens=10, total_tokens=10),
+        )
+    )
+    expected: Final = (
+        2 * (10 * input_rate + 20 * output_rate)
+        if call_type == CallTypes.aresponses_websocket.value else 10 * input_rate
+    ) * (3 if token_override else 1)
+    assert completion_cost(
+        completion_response=result, model=model, call_type=call_type, custom_llm_provider="openai",
+        custom_pricing=logger.custom_pricing_for(result), router_model_id=logger.get_router_model_id(),
+        litellm_logging_obj=logger,
+    ) == pytest.approx(expected)
+    if cached_cost is not None:
+        result.hidden_params = {"response_cost": cached_cost}
+    assert logger.response_cost_calculator(result) == pytest.approx(
+        cached_cost if cached_cost is not None else expected
+    )
+
+
+@pytest.mark.parametrize("call_type", ("responses", "aresponses", "get_responses", "aget_responses"))
+@pytest.mark.parametrize("status", ("queued", "in_progress", "completed", "failed", "cancelled", "incomplete"))
+@pytest.mark.parametrize("with_usage", (False, True))
+@pytest.mark.parametrize("as_mapping", (False, True))
+def test_request_prices_wait_for_background_response_settlement(
+    local_model_cost_map: None, call_type: str, status: str, with_usage: bool, as_mapping: bool,
+) -> None:
+    model: Final = "openai/unit-background-price-lifecycle"
+    request_price: Final = 0.02
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "background", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {"id": "unit-background-lifecycle", "output_cost_per_request": request_price},
+    }])
+    response: Final = ResponsesAPIResponse(
+        id="resp_background_lifecycle", object="response", model=model, created_at=1,
+        background=True, status=status, output=[],
+        usage=ResponseAPIUsage(input_tokens=10, output_tokens=20, total_tokens=30) if with_usage else None,
+    )
+    response.hidden_params = {"response_cost": 0.5}
+    logger: Final = Logging(
+        model=model, messages=[], stream=False, call_type=call_type, start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="background-lifecycle", function_id="background-lifecycle",
+    )
+    logger.update_environment_variables(
+        optional_params={}, litellm_params={"metadata": {"model_info": router.model_list[0]["model_info"]}},
+    )
+    result: Final = response.model_dump() if as_mapping else response
+    expected: Final = 0.0 if status in ("queued", "in_progress") else request_price
+    assert completion_cost(
+        completion_response=result, model=model, call_type=call_type, custom_llm_provider="openai",
+        custom_pricing=True, router_model_id=logger.get_router_model_id(), litellm_logging_obj=logger,
+    ) == pytest.approx(expected)
+    assert logger.response_cost_calculator(result) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("as_mapping", (False, True))
+def test_native_batch_management_does_not_charge_request_or_token_prices(
+    local_model_cost_map: None, as_mapping: bool,
+) -> None:
+    model: Final = "openai/unit-batch-management-cost"
+    litellm.register_model({model: {
+        "litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 0.001,
+        "output_cost_per_token": 0.002,
+    }})
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "batch", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {"id": "batch-management-cost", "output_cost_per_request": 0.02},
+    }])
+    logger: Final = Logging(
+        model=model, messages=[], stream=False, call_type="pass_through_endpoint",
+        start_time=datetime.datetime(2026, 1, 1), litellm_call_id="batch-management", function_id="batch-management",
+    )
+    logger.update_environment_variables(optional_params={}, litellm_params={
+        "metadata": {"model_info": router.model_list[0]["model_info"]},
+    })
+    response: Final = ModelResponse(model=model, choices=[], usage=Usage(
+        prompt_tokens=10, completion_tokens=20, total_tokens=30,
+    )).model_copy(update={"object": "batch"})
+    result: Final = response.model_dump() if as_mapping else response
+    assert completion_cost(
+        completion_response=result, model=model, call_type="pass_through_endpoint", custom_pricing=True,
+        router_model_id=logger.get_router_model_id(), litellm_logging_obj=logger,
+    ) == 0.0
+    assert logger.response_cost_calculator(result) == 0.0
+
+
+@pytest.mark.parametrize("source", ("passthrough", "proxy_request"))
+@pytest.mark.parametrize("path, billable", (
+    ("/v1/projects/p/locations/us/publishers/google/models/priced:countTokens", False),
+    ("/v1/projects/p/locations/us/publishers/anthropic/models/count-tokens:rawPredict", False),
+    ("/v1beta/models/priced:countTokens?alt=json", False),
+    ("/v1/messages/count_tokens", False),
+    ("/v1/responses/input_tokens", False),
+    ("/v1beta/models/count_tokens:generateContent?note=countTokens", True),
+))
+def test_token_counting_passthrough_does_not_charge_configured_request_prices(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch, source: str, path: str, billable: bool,
+) -> None:
+    model: Final = "openai/unit-token-counting-price"
+    price: Final = 0.02
+    fixed_margin: Final = 0.003
+    monkeypatch.setattr(litellm, "cost_margin_config", {"openai": {"fixed_amount": fixed_margin}})
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "priced", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {"id": "token-counting-price", "output_cost_per_request": price},
+    }])
+    logger: Final = Logging(
+        model=model, messages=[], stream=False, call_type="pass_through_endpoint",
+        start_time=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+        litellm_call_id="token-counting", function_id="token-counting",
+    )
+    url: Final = f"https://upstream.unit{path}"
+    logger.update_environment_variables(optional_params={}, litellm_params={
+        "metadata": {"model_info": router.model_list[0]["model_info"]},
+        **({"proxy_server_request": {"url": url}} if source == "proxy_request" else {}),
+    }, custom_llm_provider="openai")
+    if source == "passthrough":
+        logger.model_call_details["passthrough_logging_payload"] = {"url": url, "request_body": {}}
+    result: Final = {"totalTokens": 17}
+    expected: Final = price + fixed_margin if billable else 0.0
+    assert completion_cost(
+        completion_response=result, model=model, custom_llm_provider="openai", call_type="pass_through_endpoint",
+        custom_pricing=True, router_model_id=logger.get_router_model_id(), litellm_logging_obj=logger,
+    ) == pytest.approx(expected)
+    assert logger.response_cost_calculator(result) == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ("pass_through_endpoint", "allm_passthrough_route"))
+@pytest.mark.parametrize("kind, priced, free", (
+    ("chat", True, False), ("text", True, False), ("images", True, False), ("responses", True, False),
+    ("raw_chat", True, False), ("raw_response", True, False), ("raw_pending_response", False, True),
+    ("embeddings", False, False), ("transcription", False, False), ("video", False, False),
+    ("batch", False, True), ("vertex_batch", False, True), ("wrapped_batch", False, True),
+    ("unknown", False, False), ("management_endpoint", False, True),
+))
+async def test_passthrough_request_prices_only_replace_supported_inference_costs(
+    local_model_cost_map: None, kind: str, priced: bool, free: bool, call_type: str,
+) -> None:
+    import json
+
+    model: Final = "openai/unit-passthrough-cost-boundary"
+    price: Final = 0.02
+    existing_cost: Final = 0.0 if free else 0.123
+    responses: Final = {
+        "chat": ModelResponse(model=model), "text": litellm.TextCompletionResponse(model=model),
+        "images": ImageResponse(data=[]),
+        "responses": ResponsesAPIResponse(id="resp_priced", model=model, created_at=1, output=[]),
+        "raw_chat": {"response": json.dumps({"object": "chat.completion", "choices": []})},
+        "raw_response": {"response": {"object": "response", "output": [], "background": True, "status": "completed"}},
+        "raw_pending_response": {"response": json.dumps({
+            "object": "response", "output": [], "background": True, "status": "queued",
+        })},
+        "embeddings": EmbeddingResponse(model=model, data=[], usage=Usage(prompt_tokens=10, total_tokens=10)),
+        "transcription": litellm.TranscriptionResponse(text="done"),
+        "video": VideoObject(id="video_priced", object="video", model=model, status="completed", seconds="8"),
+        "batch": ModelResponse(model=model).model_copy(update={"object": "batch"}),
+        "vertex_batch": ModelResponse(model=model).model_copy(update={"object": "batch_prediction_job"}),
+        "wrapped_batch": {"response": json.dumps({"id": "batch_priced", "object": "batch"})},
+        "unknown": {"response": "opaque upstream response"}, "management_endpoint": ModelResponse(model=model),
+    }
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "priced", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {"id": "passthrough-cost-boundary", "output_cost_per_request": price},
+    }])
+    now: Final = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    logger: Final = Logging(
+        model=model, messages=[], stream=False, call_type=call_type, start_time=now,
+        litellm_call_id="passthrough-cost-boundary", function_id="passthrough-cost-boundary",
+    )
+    logger.update_environment_variables(optional_params={}, litellm_params={
+        "metadata": {"model_info": router.model_list[0]["model_info"]},
+        **({"proxy_server_request": {"url": "https://proxy.unit/v1/llm_passthrough"}}
+           if kind == "management_endpoint" else {}),
+    }, custom_llm_provider="openai", **({"endpoint": "v1/batches"} if kind == "management_endpoint" else {}))
+    logger.model_call_details["response_cost"] = existing_cost
+    await logger.async_success_handler(result=responses[kind], start_time=now, end_time=now)
+    assert logger.model_call_details["response_cost"] == pytest.approx(price if priced else existing_cost)
+
+
+@pytest.mark.parametrize("call_type", ("get_responses", "aget_responses"))
+@pytest.mark.parametrize("as_mapping", (False, True))
+@pytest.mark.parametrize("with_request_model", (False, True))
+def test_background_request_prices_keep_response_model_discounts(
+    local_model_cost_map: None, monkeypatch: pytest.MonkeyPatch,
+    call_type: str, as_mapping: bool, with_request_model: bool,
+) -> None:
+    model: Final = "openai/unit-background-model-discount"
+    request_price: Final = 0.02
+    discount: Final = 0.25
+    margin: Final = 0.5
+    monkeypatch.setattr(litellm, "cost_discount_config", {model: discount})
+    monkeypatch.setattr(litellm, "cost_margin_config", {"openai": margin})
+    router: Final = litellm.Router(model_list=[{
+        "model_name": "background", "litellm_params": {"model": model, "api_key": "unused"},
+        "model_info": {"id": "background-model-discount", "output_cost_per_request": request_price},
+    }])
+    logger: Final = Logging(
+        model=model if with_request_model else None, messages=[], stream=False, call_type=call_type,
+        start_time=datetime.datetime(2026, 1, 1), litellm_call_id="background-discount",
+        function_id="background-discount",
+    )
+    logger.update_environment_variables(optional_params={}, litellm_params={
+        "metadata": {"model_info": router.model_list[0]["model_info"]},
+    })
+    response: Final = ResponsesAPIResponse(
+        id="resp_background_discount", object="response", model=model, created_at=1,
+        background=True, status="completed", output=[],
+        usage=ResponseAPIUsage(input_tokens=10, output_tokens=20, total_tokens=30),
+    )
+    result: Final = response.model_dump() if as_mapping else response
+    expected: Final = request_price * (1 - discount) * (1 + margin)
+    assert completion_cost(
+        completion_response=result, model=model if with_request_model else None,
+        call_type=call_type, custom_pricing=True, router_model_id=logger.get_router_model_id(),
+        litellm_logging_obj=logger,
+    ) == pytest.approx(expected)
+    assert logger.response_cost_calculator(result) == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("provider", ("openai", "gemini"))
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("backup_price", (None, 0.0, 0.02))
+async def test_configured_request_price_follows_real_router_fallback(
+    local_model_cost_map: None,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    stream: bool,
+    backup_price: float | None,
+) -> None:
+    import yaml
+    from pydantic import TypeAdapter
+    from litellm.types.router import DeploymentTypedDict
+
+    model: Final = "unit-request-fallback"
+    litellm.register_model({f"{provider}/{model}": {
+        "litellm_provider": provider, "mode": "chat",
+        "input_cost_per_token": 0.001, "output_cost_per_token": 0.002,
+    }})
+    backup_config: Final = f"    output_cost_per_request: {backup_price}\n" if backup_price is not None else ""
+    models: Final = TypeAdapter(
+        list[DeploymentTypedDict], config={"arbitrary_types_allowed": True}
+    ).validate_python(yaml.safe_load(f"""
+- model_name: primary
+  litellm_params:
+    model: {provider}/{model}
+    api_key: unused
+    api_base: https://primary.test/v1
+  model_info:
+    id: primary-request-price
+    output_cost_per_request: 0.01
+- model_name: backup
+  litellm_params:
+    model: {provider}/{model}
+    api_key: unused
+    api_base: https://backup.test/v1
+  model_info:
+    id: backup-request-price
+{backup_config}"""))
+    router: Final = litellm.Router(
+        model_list=models, fallbacks=[{"primary": ["backup"]}], num_retries=0,
+        max_fallbacks=1, disable_cooldowns=True,
+    )
+    callback: Final = ResponseCostCapture()
+    monkeypatch.setattr(litellm, "_async_success_callback", [callback])
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    primary: Final = respx.post(url__startswith="https://primary.test/").respond(
+        500, json={"error": {"message": "primary failed", "type": "server_error", "status": "INTERNAL"}},
+    )
+    body: Final = (
+        {
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "done"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30},
+        }
+        if provider == "gemini"
+        else {
+            "id": "chatcmpl-fallback", "object": "chat.completion", "created": 1, "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        }
+    )
+    chunk: Final = (
+        body if provider == "gemini" else {
+            **body, "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+        }
+    )
+    backup: Final = respx.post(url__startswith="https://backup.test/").mock(return_value=(
+        httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\n", headers={"content-type": "text/event-stream"})
+        if stream else httpx.Response(200, json=body)
+    ))
+    response: Final = await router.acompletion(
+        model="primary", messages=[{"role": "user", "content": "hello"}], stream=stream,
+    )
+    if stream:
+        async for _ in response:
+            pass
+    else:
+        assert response.choices[0].message.content == "done"
+    await GLOBAL_LOGGING_WORKER.flush()
+    assert await asyncio.to_thread(callback.success_event.wait, 10.0)
+    assert len(primary.calls) == 1
+    assert len(backup.calls) == 1
+    assert callback.success_cost == pytest.approx(backup_price if backup_price is not None else 10 * 0.001 + 20 * 0.002)

@@ -8,8 +8,11 @@ Regression coverage for the guardrail route table bugs:
   take call_types[0] to a handler-less type
 """
 
+import pytest
+
 from litellm.litellm_core_utils.api_route_to_call_types import (
     get_call_types_for_route,
+    get_passthrough_call_types_for_route,
 )
 from litellm.types.utils import API_ROUTE_TO_CALL_TYPES, CallTypes
 
@@ -110,3 +113,45 @@ class TestExistingRouteResolutionUnchanged:
 
     def test_unknown_route_returns_none(self):
         assert get_call_types_for_route("/not/a/real/route") is None
+
+
+@pytest.mark.parametrize("route", (
+    "/bedrock/model/team/priced/converse", "/bedrock/v2/model/team/priced/converse-stream/",
+    "/bedrock/model/arn:aws:bedrock:us:123:application-inference-profile/profile/invoke",
+    "/bedrock/model/priced/invoke-with-response-stream?trace=enabled",
+    "/cohere/v2/chat",
+    "/vertex-ai/v1/projects/p/locations/us/publishers/anthropic/models/priced:rawPredict",
+    "/vertex_ai/v1beta1/projects/p/locations/us/publishers/anthropic/models/priced:streamRawPredict",
+))
+def test_native_inference_routes_resolve_as_passthrough_calls(route: str) -> None:
+    assert get_passthrough_call_types_for_route(route) == (
+        CallTypes.allm_passthrough_route, CallTypes.llm_passthrough_route,
+    )
+
+
+@pytest.mark.parametrize("route", (
+    "/bedrock/model/priced/count-tokens", "/bedrock/model/priced/invoke/status",
+    "/bedrock/model/priced/converse-but-not-an-action", "/bedrock/model//converse",
+    "/cohere/v2/embed", "/cohere/v1/chat", "/cohere/v2/chat/status", "/coherefake/v2/chat",
+    "/vertex-ai/v1/projects/p/locations/us/publishers/google/models/priced:predictLongRunning",
+))
+def test_other_native_routes_are_not_classified_as_conversation_calls(route: str) -> None:
+    assert get_passthrough_call_types_for_route(route) is None
+
+
+@pytest.mark.parametrize("provider", ("azure", "azure_ai"))
+@pytest.mark.parametrize("native_path", (
+    "openai/{operation}", "openai/v1/{operation}", "openai/deployments/priced/{operation}",
+    "priced/openai/{operation}", "priced/openai/v1/{operation}", "priced/{operation}",
+    "models/{operation}", "priced/models/{operation}",
+))
+@pytest.mark.parametrize("operation", (
+    "responses", "chat/completions", "completions", "images/generations", "embeddings",
+    "audio/speech", "batches", "responses/resp_unit/input_items",
+))
+def test_azure_native_operations_resolve_to_the_same_call_types(
+    provider: str, native_path: str, operation: str,
+) -> None:
+    assert get_passthrough_call_types_for_route(
+        f"/{provider}/{native_path.format(operation=operation)}?api-version=unit", model_group="priced",
+    ) == get_call_types_for_route(f"/{operation}")

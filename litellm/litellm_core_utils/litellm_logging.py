@@ -50,6 +50,7 @@ from litellm.cost_calculator import (
     RealtimeAPITokenUsageProcessor,
     ResponsesWebSocketTokenUsageProcessor,
     get_usage_object,
+    is_request_priced_call,
     pricing_entry_for_cost_calc,
     select_model_name_for_cost_calc,
 )
@@ -73,6 +74,8 @@ from litellm.litellm_core_utils.classifier_logging import (
     is_classifier_call,
 )
 from litellm.litellm_core_utils.core_helpers import (
+    as_str_mapping,
+    attribute_or_none,
     get_provider_response_headers_from_hidden_params,
     is_expected_client_error,
     proxy_stamped_used_client_oauth_token,
@@ -84,6 +87,7 @@ from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
 from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR, set_hidden_param
 from litellm.litellm_core_utils.internal_call_metadata import (
     MODEL_ACCESS_GROUP_METADATA_KEY,
+    is_token_counting_passthrough,
     is_unbilled_non_inference_call,
 )
 from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import (
@@ -325,7 +329,9 @@ def _get_provider_request_id(original_exception: Exception) -> str | None:
 ### GLOBAL VARIABLES ###
 
 # Cache custom pricing keys as frozenset for O(1) lookups instead of looping through 49 keys
-_CUSTOM_PRICING_KEYS: Final[frozenset[str]] = frozenset(CustomPricingLiteLLMParams.model_fields.keys())
+_CUSTOM_PRICING_KEYS: Final[frozenset[str]] = frozenset(CustomPricingLiteLLMParams.model_fields.keys()).difference(
+    ("output_cost_per_request",)
+)
 _MODEL_INFO_CUSTOM_PRICING_KEYS: Final[frozenset[str]] = _CUSTOM_PRICING_KEYS | DEPLOYMENT_SCOPED_PRICING_FIELDS
 _UNSERIALIZABLE_METADATA_KEYS: Final[frozenset[str]] = frozenset(
     ("user_api_key_auth", "user_api_key_budget_reservation")
@@ -430,6 +436,13 @@ def _published_direction(
             and (key == flat_key or (key.startswith(prefixes) and key.endswith(_BATCH_PRICING_KEY_SUFFIX)))
         }
     )
+
+
+def deployment_request_price(model_id: str | None) -> float | None:
+    costs: Final = as_str_mapping(attribute_or_none(litellm, "model_cost"))
+    registered: Final = as_str_mapping(costs.get(model_id)) if costs is not None and model_id is not None else None
+    price: Final = registered.get("output_cost_per_request") if registered is not None else None
+    return float(price) if isinstance(price, (int, float)) else None
 
 
 def deployment_pricing_model_info(model_id: str | None, deployment_model: str | None) -> ModelInfo | None:
@@ -624,7 +637,7 @@ class Logging(LiteLLMLoggingBaseClass):
         model: str,
         messages,
         stream,
-        call_type,
+        call_type: str,
         start_time: datetime.datetime,
         litellm_call_id: str,
         function_id: str,
@@ -1902,7 +1915,7 @@ class Logging(LiteLLMLoggingBaseClass):
         if cache_hit is None:
             cache_hit = self.model_call_details.get("cache_hit", False)
 
-        if cache_hit is True:
+        if cache_hit is True or is_token_counting_passthrough(self.call_type, self.model_call_details):
             return 0.0
 
         if is_unbilled_non_inference_call(
@@ -1920,6 +1933,8 @@ class Logging(LiteLLMLoggingBaseClass):
             if isinstance(response_result, (ResponseCompletedEvent, ResponseIncompleteEvent, ResponseFailedEvent))
             else response_result
         )
+        custom_pricing: Final = self.custom_pricing_for(priced_result)
+        request_price: Final = self.request_price_for(priced_result)
 
         result_hidden_params: Final = getattr(priced_result, HIDDEN_PARAMS_ATTR, None) or MappingProxyType({})
         if isinstance(priced_result, (BaseModel, HttpxBinaryResponseContent)) and hasattr(
@@ -1927,7 +1942,9 @@ class Logging(LiteLLMLoggingBaseClass):
         ):
             hidden_params: Final = result_hidden_params
             if (
-                "response_cost" in hidden_params and hidden_params["response_cost"] is not None
+                "response_cost" in hidden_params
+                and hidden_params["response_cost"] is not None
+                and request_price is None
             ):  # use cost if already calculated
                 self._record_zero_cost_diagnostic(
                     priced_result,
@@ -1946,8 +1963,6 @@ class Logging(LiteLLMLoggingBaseClass):
             router_model_id = self.get_router_model_id()
 
         ## RESPONSE COST ##
-        custom_pricing: Final = self.custom_pricing_for(priced_result)
-
         prompt: Final = self._prompt_for_cost_calculation()
 
         model_value: Final = litellm_model_name or self.model
@@ -2146,7 +2161,16 @@ class Logging(LiteLLMLoggingBaseClass):
     def custom_pricing_for(self, result: object) -> bool:
         if self.spilled_over_ptu_for(result):
             return False
-        return use_custom_pricing_for_model(litellm_params=getattr(self, "litellm_params", None))
+        if use_custom_pricing_for_model(litellm_params=getattr(self, "litellm_params", None)):
+            return True
+        return self.request_price_for(result) is not None
+
+    def request_price_for(self, result: object) -> float | None:
+        if not is_request_priced_call(self.call_type, result, self.model_call_details):
+            return None
+        if self.spilled_over_ptu_for(result):
+            return None
+        return deployment_request_price(self.get_router_model_id())
 
     def _prompt_for_cost_calculation(self) -> str:
         """
@@ -2446,7 +2470,7 @@ class Logging(LiteLLMLoggingBaseClass):
                 results=result,
             )
 
-        elif self.call_type == CallTypes.aresponses_websocket.value and isinstance(result, list):  # pyright: ignore[reportUnknownMemberType]  # Logging.call_type is untyped
+        elif self.call_type == CallTypes.aresponses_websocket.value and isinstance(result, list):
             logging_result = ResponsesWebSocketTokenUsageProcessor.create_logging_object(
                 results=result  # pyright: ignore[reportUnknownArgumentType]  # raw event dicts from the WS stream
             )
@@ -2505,7 +2529,7 @@ class Logging(LiteLLMLoggingBaseClass):
 
     def _process_hidden_params_and_response_cost(
         self,
-        logging_result,
+        logging_result: object,
         start_time,
         end_time,
         build_logging_payload: bool = True,
@@ -2523,8 +2547,12 @@ class Logging(LiteLLMLoggingBaseClass):
                     logging_result, "_hidden_params", {}
                 )
 
-        if self.model_call_details.get("cache_hit") is True:
+        if self.model_call_details.get("cache_hit") is True or is_token_counting_passthrough(
+            self.call_type, self.model_call_details
+        ):
             self.model_call_details["response_cost"] = 0.0
+        elif self.request_price_for(logging_result) is not None:
+            self.model_call_details["response_cost"] = self.response_cost_calculator(result=logging_result)
         elif "response_cost" in hidden_params:
             self.model_call_details["response_cost"] = hidden_params["response_cost"]
             self._record_zero_cost_diagnostic(logging_result, hidden_params["response_cost"])

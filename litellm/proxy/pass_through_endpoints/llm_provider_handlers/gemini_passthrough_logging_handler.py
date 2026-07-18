@@ -231,6 +231,9 @@ class GeminiPassthroughLoggingHandler:
             completion_response=litellm_model_response,
             model=model,
             custom_llm_provider="gemini",
+            custom_pricing=logging_obj.request_price_for(litellm_model_response) is not None,
+            router_model_id=logging_obj.get_router_model_id(),
+            litellm_logging_obj=logging_obj,
         )
 
         kwargs["response_cost"] = response_cost
