@@ -7595,6 +7595,7 @@ def get_model_info_helper(
                 output_cost_per_character_above_128k_tokens=_model_info.get(
                     "output_cost_per_character_above_128k_tokens", None
                 ),
+                output_cost_per_request=_model_info.get("output_cost_per_request", None),
                 output_cost_per_token_above_200k_tokens=_model_info.get(
                     "output_cost_per_token_above_200k_tokens", None
                 ),

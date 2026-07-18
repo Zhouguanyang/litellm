@@ -2,7 +2,7 @@ import asyncio
 import json
 from collections.abc import Iterator
 from datetime import datetime
-from typing import Final
+from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -19,6 +19,7 @@ from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    EndpointType,
     PassthroughStandardLoggingPayload,
 )
 
@@ -422,9 +423,10 @@ class TestGeminiPassthroughLoggingHandler:
             "status": "completed",
             "usage": usage,
         }
-        mock_logging_obj = MagicMock(spec=LiteLLMLoggingObj)
-        mock_logging_obj.model_call_details = {}
-        mock_logging_obj.litellm_call_id = "call-6896"
+        mock_logging_obj: Final = LiteLLMLoggingObj(
+            model="gemini-omni-flash-preview", messages=[], stream=False, call_type="pass_through_endpoint",
+            start_time=self.start_time, litellm_call_id="call-6896", function_id="interactions-cost",
+        )
 
         result = GeminiPassthroughLoggingHandler.gemini_passthrough_handler(
             httpx_response=mock_httpx_response,
@@ -592,3 +594,116 @@ def test_gemini_passthrough_bills_the_list_price_when_the_model_info_base_model_
     recorded: Final = _cost_the_logger_records_for_gemini(stream=stream, model_info={"base_model": base_model})
 
     assert recorded == pytest.approx(7 * _LIST_INPUT_RATE + 1 * _LIST_OUTPUT_RATE), stream
+
+
+@pytest.mark.parametrize("has_output_image", (False, True))
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("metadata_key", ("metadata", "litellm_metadata"))
+@pytest.mark.parametrize("backup_pricing", ("published", "request", "free"))
+def test_gemini_passthrough_prices_the_successful_deployment(
+    local_model_cost_map: None,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+    has_output_image: bool,
+    metadata_key: str,
+    backup_pricing: Literal["published", "request", "free"],
+) -> None:
+    import litellm.proxy.proxy_server as proxy_server
+
+    model: Final = "gemini-fallback-pricing-test"
+    rates: Final = {
+        "published": {},
+        "request": {"output_cost_per_request": 0.02},
+        "free": {"output_cost_per_request": 0.0},
+    }
+    litellm.register_model(
+        {
+            f"gemini/{model}": {
+                "litellm_provider": "gemini",
+                "mode": "chat",
+                "input_cost_per_token": 0.001,
+                "output_cost_per_token": 0.002,
+            }
+        }
+    )
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "primary",
+                "litellm_params": {"model": f"gemini/{model}", "api_key": "unused"},
+                "model_info": {"id": "primary", "output_cost_per_request": 0.01},
+            },
+            {
+                "model_name": "backup",
+                "litellm_params": {"model": f"gemini/{model}", "api_key": "unused"},
+                "model_info": {"id": "backup", **rates[backup_pricing]},
+            },
+        ]
+    )
+    monkeypatch.setattr(proxy_server, "llm_router", router)
+    monkeypatch.setattr(proxy_server, "llm_model_list", router.model_list)
+    now: Final = datetime(2026, 1, 1)
+    logging_obj: Final = LiteLLMLoggingObj(
+        model=model,
+        messages=[],
+        stream=stream,
+        call_type="pass_through_endpoint",
+        start_time=now,
+        litellm_call_id="fallback-pricing",
+        function_id="fallback-pricing",
+    )
+    logging_obj.update_environment_variables(
+        optional_params={},
+        litellm_params={metadata_key: {"model_info": router.model_list[1]["model_info"]}},
+    )
+    logging_obj.model_call_details["custom_llm_provider"] = "gemini"
+    body: Final = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "ok"},
+                        *([{"inlineData": {"mimeType": "image/png", "data": "aW1n"}}] if has_output_image else ()),
+                    ],
+                },
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30},
+    }
+    route: Final = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    result: Final = (
+        GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=PassThroughEndpointLogging(),
+            url_route=route.replace(":generateContent", ":streamGenerateContent"),
+            request_body={},
+            endpoint_type=EndpointType.GEMINI,
+            start_time=now,
+            end_time=now,
+            all_chunks=[f"data: {json.dumps(body)}\n\n"],
+            model=model,
+        )
+        if stream
+        else GeminiPassthroughLoggingHandler.gemini_passthrough_handler(
+            httpx_response=httpx.Response(200, json=body),
+            response_body=body,
+            logging_obj=logging_obj,
+            url_route=route,
+            result="",
+            start_time=now,
+            end_time=now,
+            cache_hit=False,
+            request_body={},
+        )
+    )
+    expected: Final = {
+        "published": 10 * 0.001 + 20 * 0.002,
+        "request": 0.02,
+        "free": 0.0,
+    }[backup_pricing]
+
+    assert result["kwargs"]["response_cost"] == pytest.approx(expected)
+    assert logging_obj.response_cost_calculator(result["result"]) == pytest.approx(expected)

@@ -8,8 +8,10 @@ Route patterns may contain placeholders like {agent_id}, {model}, {batch_id}; th
 match a single path segment when resolving call types for a concrete path.
 """
 
+import re
 from collections.abc import Sequence
 from typing import Final
+from urllib.parse import urlsplit
 
 from litellm.types.utils import API_ROUTE_TO_CALL_TYPES, CallTypes
 
@@ -78,6 +80,34 @@ def get_call_types_for_route(route: str) -> Sequence[CallTypes] | None:
         if _route_matches_pattern(route, pattern):
             return call_types
     return None
+
+
+def get_passthrough_call_types_for_route(route: str, model_group: str = "") -> Sequence[CallTypes] | None:
+    from litellm.llms.base_llm.passthrough.transformation import strip_leading_model_segment
+    from litellm.proxy._types import LiteLLMRoutes
+
+    path: Final = f"/{urlsplit(route).path.strip('/')}"
+    prefix, _, tail = path.removeprefix("/").partition("/")
+    endpoint: Final = f"/{tail}" if f"/{prefix}" in LiteLLMRoutes.mapped_pass_through_routes.value else path
+    azure_endpoint: Final = re.sub(
+        r"^/(?:openai/(?:deployments/[^/]+/)?|models/)", "/",
+        f"/{strip_leading_model_segment(endpoint, (model_group,))}",
+    ) if prefix in ("azure", "azure_ai") else endpoint
+    native_inference: Final = (
+        prefix == "bedrock" and re.fullmatch(
+            r"/(?:v2/)?model/.+/(?:converse(?:-stream)?|invoke(?:-with-response-stream)?)", endpoint,
+        ) is not None
+    ) or (
+        prefix == "cohere" and endpoint == "/v2/chat"
+    ) or (
+        prefix in ("vertex_ai", "vertex-ai") and re.fullmatch(
+            r"/v1(?:beta1)?/projects/[^/]+/locations/[^/]+/publishers/anthropic/models/[^:]+:"
+            r"(?:rawPredict|streamRawPredict)", endpoint,
+        ) is not None
+    )
+    if native_inference:
+        return (CallTypes.allm_passthrough_route, CallTypes.llm_passthrough_route)
+    return get_call_types_for_route(path) or get_call_types_for_route(azure_endpoint)
 
 
 def get_routes_for_call_type(call_type: CallTypes) -> list:
