@@ -1,6 +1,7 @@
 name: Terraform Provider
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "terraform/provider/**"
