@@ -3,7 +3,7 @@
     "limit": 13429
   },
   "reportArgumentType": {
-    "limit": 2198
+    "limit": 2201
   },
   "reportAssignmentType": {
     "limit": 319
@@ -30,10 +30,10 @@
     "limit": 7
   },
   "reportGeneralTypeIssues": {
-    "limit": 101
+    "limit": 102
   },
   "reportIncompatibleMethodOverride": {
-    "limit": 56
+    "limit": 59
   },
   "reportIncompatibleVariableOverride": {
     "limit": 8
@@ -114,7 +114,7 @@
     "limit": 29814
   },
   "reportUnnecessaryCast": {
-    "limit": 110
+    "limit": 111
   },
   "reportUnnecessaryComparison": {
     "limit": 687
@@ -141,6 +141,6 @@
     "limit": 542
   },
   "reportUnusedVariable": {
-    "limit": 137
+    "limit": 285
   }
 }
