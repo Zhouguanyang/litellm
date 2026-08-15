@@ -6,6 +6,7 @@ import anthropicLogo from "../../public/assets/logos/anthropic.svg";
 import assemblyaiSmallLogo from "../../public/assets/logos/assemblyai_small.png";
 import basetenLogo from "../../public/assets/logos/baseten.svg";
 import bedrockLogo from "../../public/assets/logos/bedrock.svg";
+import byteplusLogo from "../../public/assets/logos/byteplus.svg";
 import cerebrasLogo from "../../public/assets/logos/cerebras.svg";
 import cloudflareLogo from "../../public/assets/logos/cloudflare.svg";
 import cohereLogo from "../../public/assets/logos/cohere.svg";
@@ -84,6 +85,7 @@ export enum Providers {
   Azure_Speech = "Azure AI Speech",
   AZURE_TEXT = "Azure Text",
   BASETEN = "Baseten",
+  BYTEPLUS = "BytePlus",
   BYTEZ = "Bytez",
   Cerebras = "Cerebras",
   CHATGPT = "ChatGPT Subscription",
@@ -199,6 +201,7 @@ export const provider_map: Record<string, string> = {
   Azure_Speech: "azure_speech",
   AZURE_TEXT: "azure_text",
   BASETEN: "baseten",
+  BYTEPLUS: "byteplus",
   Bedrock: "bedrock",
   BedrockMantle: "bedrock_mantle",
   BYTEZ: "bytez",
@@ -392,6 +395,7 @@ export const providerLogoMap: Partial<Record<Providers, string>> = {
   [Providers.VERTEX_AI_BETA]: googleLogo.src,
   [Providers.VLLM]: vllmLogo.src,
   [Providers.VolcEngine]: volcengineLogo.src,
+  [Providers.BYTEPLUS]: byteplusLogo.src,
   [Providers.Voyage]: voyageLogo.src,
   [Providers.WATSONX]: watsonxLogo.src,
   [Providers.WATSONX_TEXT]: watsonxLogo.src,
@@ -437,6 +441,7 @@ const providerPlaceholderMap: Partial<Record<Providers, string>> = {
   [Providers.Azure_Speech]: "azure_speech/short-audio",
   [Providers.Bedrock]: "claude-3-opus",
   [Providers.CHATGPT]: "chatgpt/gpt-5.4",
+  [Providers.BYTEPLUS]: "byteplus/<any-model-on-byteplus>",
   [Providers.Cognition]: "cognition/swe-1.7",
   [Providers.Cursor]: "cursor/claude-4-sonnet",
   [Providers.DeepInfra]: "deepinfra/<any-model-on-deepinfra>",
