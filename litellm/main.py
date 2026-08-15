@@ -6015,6 +6015,7 @@ def completion(
             or custom_llm_provider == "baseten"
             or custom_llm_provider == "sambanova"
             or custom_llm_provider == "volcengine"
+            or custom_llm_provider == "byteplus"
             or custom_llm_provider == "anyscale"
             or custom_llm_provider == "openai"
             or custom_llm_provider == "nebius"
@@ -7292,6 +7293,33 @@ def embedding(
                 aembedding=aembedding,
                 headers=headers,
             )
+        elif custom_llm_provider == "byteplus":
+            byteplus_key: Final = (
+                api_key or litellm.api_key or get_secret_str("BYTEPLUS_API_KEY") or get_secret_str("ARK_API_KEY")
+            )
+            if byteplus_key is None:
+                raise ValueError(
+                    "Missing API key for BytePlus. Set BYTEPLUS_API_KEY or ARK_API_KEY environment variable or pass api_key parameter."
+                )
+            if extra_headers is not None and isinstance(extra_headers, dict):
+                headers = extra_headers  # rebind-ok: same pattern as volcengine block above
+            else:
+                headers = {}  # rebind-ok: same pattern as volcengine block above
+            response = base_llm_http_handler.embedding(  # rebind-ok: same pattern as volcengine block above
+                model=model,
+                input=input,
+                timeout=timeout,
+                custom_llm_provider=custom_llm_provider,
+                logging_obj=logging,
+                api_base=api_base,
+                optional_params=optional_params,
+                litellm_params={},
+                model_response=EmbeddingResponse(),
+                api_key=byteplus_key,
+                client=client,
+                aembedding=aembedding,
+                headers=headers,
+            )
         elif custom_llm_provider in ("dashscope", "qwencloud", "qwen_ai_platform"):
             from litellm.llms.dashscope.common_utils import (
                 missing_dashscope_family_key_message,
@@ -8457,6 +8485,7 @@ def speech(
     elif custom_llm_provider == "openai" or (
         custom_llm_provider in litellm.openai_compatible_providers
         and custom_llm_provider not in AZURE_OPENAI_AUDIO_PROVIDERS
+        and custom_llm_provider != "byteplus"
     ):
         if voice is None or not (isinstance(voice, str)):
             raise litellm.BadRequestError(
@@ -8811,13 +8840,10 @@ def speech(
             AWSPollyTextToSpeechConfig,
         )
 
-        # AWS Polly Text-to-Speech
         if text_to_speech_provider_config is None:
             text_to_speech_provider_config = AWSPollyTextToSpeechConfig()
 
-        # Cast to specific AWS Polly config type to access dispatch method
         aws_polly_config: Final = cast(AWSPollyTextToSpeechConfig, text_to_speech_provider_config)
-
         response = aws_polly_config.dispatch_text_to_speech(
             model=model,
             input=input,
@@ -8831,6 +8857,35 @@ def speech(
             aspeech=aspeech or False,
             api_base=api_base,
             api_key=api_key,
+            **kwargs,
+        )
+    elif custom_llm_provider == "byteplus":
+        from litellm.llms.base_llm.text_to_speech.transformation import (
+            BaseTextToSpeechConfig,
+        )
+
+        if text_to_speech_provider_config is None:
+            raise litellm.BadRequestError(
+                message=f"{custom_llm_provider} Text-to-Speech configuration not found",
+                model=model,
+                llm_provider=custom_llm_provider,
+            )
+
+        dispatch_config: Final = cast(BaseTextToSpeechConfig, text_to_speech_provider_config)
+        response = dispatch_config.dispatch_text_to_speech(  # rebind-ok: same pattern as other TTS provider blocks
+            model=model,
+            input=input,
+            voice=voice,
+            optional_params=optional_params,
+            litellm_params_dict=litellm_params_dict,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            base_llm_http_handler=base_llm_http_handler,
+            aspeech=aspeech or False,
+            api_base=api_base,
+            api_key=api_key,
+            client=client,
             **kwargs,
         )
 
