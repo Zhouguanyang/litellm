@@ -28,10 +28,10 @@ Response format:
 
 import re
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, NoReturn
 
 import httpx
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from litellm.exceptions import UnsupportedParamsError
 from litellm.llms.openrouter.common_utils import OpenRouterException
@@ -63,6 +63,7 @@ PIXEL_SIZE_PATTERN: Final = re.compile(r"(\d+)x(\d+)")
 
 NON_BODY_PARAMS: Final = frozenset({"model", "prompt", "extra_headers"})
 LEGACY_CHAT_COMPLETIONS_SUFFIX: Final = "/chat/completions"
+IMAGE_URLS_ADAPTER: Final = TypeAdapter(tuple[str, ...])
 
 
 def resolve_images_url(api_base: str | None) -> str:
@@ -108,12 +109,69 @@ def map_image_params(params: Mapping[str, object], model: str, drop_params: bool
     if response_format is not None:
         _reject_unsupported_response_format(value=str(response_format), model=model, drop_params=drop_params)
 
-    translated: Final = (_translate_param(key=key, value=value) for key, value in params.items())
+    image: Final = params.get("image")
+    input_references: Final = params.get("input_references")
+    if _has_input_references(image) and _has_input_references(input_references):
+        raise UnsupportedParamsError(
+            model=model,
+            llm_provider="openrouter",
+            message="OpenRouter image requests cannot specify both `image` and `input_references`.",
+        )
+
+    normalized_input_references: Final = normalize_input_references(value=image, model=model)
+    translated: Final = (
+        ("input_references", normalized_input_references)
+        if key == "image" and normalized_input_references
+        else _translate_param(key=key, value=value)
+        for key, value in params.items()
+    )
     return {key: value for key, value in translated if key is not None}
 
 
+def normalize_input_references(value: object, model: str) -> tuple[Mapping[str, object], ...]:
+    if value is None or value == "":
+        return ()
+    if not isinstance(value, (str, list, tuple)):
+        _raise_invalid_image_param(model=model)
+
+    image_urls_input: Final = (value,) if isinstance(value, str) else value
+    try:
+        image_urls: Final = IMAGE_URLS_ADAPTER.validate_python(image_urls_input)
+    except ValidationError:
+        _raise_invalid_image_param(model=model)
+
+    return tuple(
+        {  # mutable-ok: OpenRouter input references must serialize as JSON objects
+            "type": "image_url",
+            "image_url": {  # mutable-ok: OpenRouter requires a nested image_url JSON object
+                "url": image_url
+            },
+        }
+        for image_url in image_urls
+        if image_url
+    )
+
+
+def _has_input_references(value: object) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, (list, tuple)):
+        return bool(value)
+    return True
+
+
+def _raise_invalid_image_param(model: str) -> NoReturn:
+    raise UnsupportedParamsError(
+        model=model,
+        llm_provider="openrouter",
+        message="OpenRouter image generation expects `image` to be a URL string or a list of URL strings.",
+    )
+
+
 def _translate_param(key: str, value: object) -> tuple[str | None, object]:
-    if key == "response_format":
+    if key in ("image", "response_format"):
+        return None, None
+    if key == "input_references" and not _has_input_references(value):
         return None, None
     if key == "size":
         aspect_ratio: Final = map_size_to_aspect_ratio(str(value))

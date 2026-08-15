@@ -135,6 +135,8 @@ class TestOpenRouterImageGenerationParams:
 
     def test_get_supported_openai_params(self):
         assert set(self.config.get_supported_openai_params(self.model)) == {
+            "image",
+            "input_references",
             "n",
             "quality",
             "response_format",
@@ -255,6 +257,90 @@ class TestOpenRouterImageGenerationParams:
 
         assert optional_params == {}
 
+    @pytest.mark.parametrize(
+        "image, expected_urls",
+        [
+            ("https://example.com/a.png", ["https://example.com/a.png"]),
+            (
+                ["https://example.com/a.png", "https://example.com/b.png"],
+                ["https://example.com/a.png", "https://example.com/b.png"],
+            ),
+            ("data:image/png;base64,aGVsbG8=", ["data:image/png;base64,aGVsbG8="]),
+        ],
+    )
+    def test_image_maps_to_openrouter_input_references(self, image, expected_urls):
+        result = self.config.map_openai_params(
+            non_default_params={"image": image},
+            optional_params={},
+            model=self.model,
+            drop_params=False,
+        )
+
+        assert "image" not in result
+        assert result["input_references"] == tuple(
+            {"type": "image_url", "image_url": {"url": url}} for url in expected_urls
+        )
+
+    @pytest.mark.parametrize("image", [None, "", []])
+    def test_empty_image_is_omitted(self, image):
+        result = self.config.map_openai_params(
+            non_default_params={"image": image},
+            optional_params={},
+            model=self.model,
+            drop_params=False,
+        )
+
+        assert result == {}
+
+    @pytest.mark.parametrize("image", [123, ["https://example.com/a.png", 123]])
+    def test_invalid_image_raises(self, image):
+        with pytest.raises(litellm.UnsupportedParamsError, match="expects `image` to be a URL string"):
+            self.config.map_openai_params(
+                non_default_params={"image": image},
+                optional_params={},
+                model=self.model,
+                drop_params=False,
+            )
+
+    def test_image_conflicts_with_input_references(self):
+        with pytest.raises(litellm.UnsupportedParamsError, match="cannot specify both"):
+            self.config.map_openai_params(
+                non_default_params={
+                    "image": "https://example.com/a.png",
+                    "input_references": [{"type": "image_url", "image_url": {"url": "https://example.com/b.png"}}],
+                },
+                optional_params={},
+                model=self.model,
+                drop_params=False,
+            )
+
+    def test_standard_input_references_pass_through(self):
+        input_references = [{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]
+
+        result = self.config.map_openai_params(
+            non_default_params={"input_references": input_references},
+            optional_params={},
+            model=self.model,
+            drop_params=False,
+        )
+
+        assert result == {"input_references": input_references}
+
+    def test_empty_input_references_do_not_override_image(self):
+        result = self.config.map_openai_params(
+            non_default_params={
+                "image": "https://example.com/a.png",
+                "input_references": [],
+            },
+            optional_params={},
+            model=self.model,
+            drop_params=False,
+        )
+
+        assert result == {
+            "input_references": ({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},)
+        }
+
 
 class TestOpenRouterImageGenerationRequest:
     def setup_method(self):
@@ -292,16 +378,17 @@ class TestOpenRouterImageGenerationRequest:
         assert result == {"model": self.model, "prompt": "a red panda astronaut", "seed": 7}
 
     def test_provider_native_params_pass_through(self):
+        input_references = [{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]
         result = self.config.transform_image_generation_request(
             model=self.model,
             prompt="a red panda astronaut",
-            optional_params={"output_format": "webp", "input_references": ["https://example.com/a.png"]},
+            optional_params={"output_format": "webp", "input_references": input_references},
             litellm_params={},
             headers={},
         )
 
         assert result["output_format"] == "webp"
-        assert result["input_references"] == ["https://example.com/a.png"]
+        assert result["input_references"] == input_references
 
 
 class TestOpenRouterImageGenerationResponse:
@@ -522,6 +609,30 @@ class TestOpenRouterImageGenerationEndToEnd:
         assert recorder.body() == {
             "model": "google/gemini-2.5-flash-image",
             "prompt": "a red panda astronaut",
+        }
+
+    def test_generation_image_reaches_openrouter_as_input_reference(self):
+        recorder = RequestRecorder(OPENROUTER_IMAGES_RESPONSE)
+
+        litellm.image_generation(
+            model="openrouter/bytedance-seed/seedream-5-0-pro",
+            prompt="turn the reference into a watercolor painting",
+            image=["https://example.com/reference.png"],
+            api_key="sk-test",
+            api_base="https://openrouter.ai/api/v1",
+            client=make_client(recorder),
+        )
+
+        assert str(recorder.request.url) == "https://openrouter.ai/api/v1/images"
+        assert recorder.body() == {
+            "model": "bytedance-seed/seedream-5-0-pro",
+            "prompt": "turn the reference into a watercolor painting",
+            "input_references": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/reference.png"},
+                }
+            ],
         }
 
     def test_openrouter_error_is_surfaced(self):
