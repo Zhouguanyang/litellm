@@ -348,6 +348,29 @@ def test_get_optional_params_image_gen_filters_empty_values():
     assert optional_params == {}
 
 
+@pytest.mark.parametrize(
+    ("param", "value"),
+    [
+        ("image", "https://example.com/reference.png"),
+        (
+            "input_references",
+            [{"type": "image_url", "image_url": {"url": "https://example.com/reference.png"}}],
+        ),
+    ],
+)
+def test_get_optional_params_image_gen_preserves_provider_native_params(param, value):
+    from litellm.llms.fal_ai.image_generation.transformation import FalAIImageGenerationConfig
+
+    optional_params = get_optional_params_image_gen(
+        model="fal-ai/custom-image-model",
+        custom_llm_provider="fal_ai",
+        provider_config=FalAIImageGenerationConfig(),
+        **{param: value},
+    )
+
+    assert optional_params == {param: value}
+
+
 def test_gpt_image_provider_detection_covers_existing_family():
     for image_model in ("gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5"):
         model, custom_llm_provider, _, _ = litellm.get_llm_provider(model=image_model)

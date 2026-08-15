@@ -54,7 +54,7 @@ class OpenRouterImageGenerationConfig(BaseImageGenerationConfig):
     """Maps ``/v1/images/generations`` onto OpenRouter's ``/api/v1/images`` endpoint."""
 
     def get_supported_openai_params(self, model: str) -> list[OpenAIImageGenerationOptionalParams]:
-        return ["n", "quality", "response_format", "size"]
+        return ["image", "input_references", "n", "quality", "response_format", "size"]
 
     def map_openai_params(
         self,
