@@ -4559,7 +4559,7 @@ def get_optional_params_image_gen(
         optional_params=optional_params,
         passed_params=passed_params,
         custom_llm_provider=custom_llm_provider or "",
-        openai_params=openai_params,
+        openai_params=(*openai_params, "extra_headers", "headers"),
         additional_drop_params=additional_drop_params,
     )
     # remove keys with None or empty dict/list values to avoid sending empty payloads
@@ -9663,6 +9663,7 @@ class ProviderConfigManager:
             LlmProviders.CEREBRAS: (lambda: litellm.CerebrasConfig(), False),
             LlmProviders.BASETEN: (lambda: litellm.BasetenConfig(), False),
             LlmProviders.VOLCENGINE: (lambda: litellm.VolcEngineConfig(), False),
+            LlmProviders.BYTEPLUS: (lambda: litellm.BytePlusConfig(), False),
             LlmProviders.TEXT_COMPLETION_CODESTRAL: (
                 lambda: litellm.CodestralTextCompletionConfig(),
                 False,
@@ -9954,6 +9955,12 @@ class ProviderConfigManager:
             )
 
             return VolcEngineEmbeddingConfig()
+        elif litellm.LlmProviders.BYTEPLUS == provider:
+            from litellm.llms.byteplus.embedding.transformation import (
+                BytePlusEmbeddingConfig,
+            )
+
+            return BytePlusEmbeddingConfig()
         elif provider in (
             litellm.LlmProviders.DASHSCOPE,
             litellm.LlmProviders.QWENCLOUD,
@@ -10413,6 +10420,8 @@ class ProviderConfigManager:
             return litellm.LiteLLMProxyResponsesAPIConfig()
         elif litellm.LlmProviders.VOLCENGINE == provider:
             return litellm.VolcEngineResponsesAPIConfig()
+        elif litellm.LlmProviders.BYTEPLUS == provider:
+            return litellm.BytePlusResponsesAPIConfig()
         elif litellm.LlmProviders.MANUS == provider:
             return litellm.ManusResponsesAPIConfig()
         elif litellm.LlmProviders.PERPLEXITY == provider:
@@ -10926,6 +10935,12 @@ class ProviderConfigManager:
             )
 
             return TencentImageGenerationConfig() if is_tokenhub_image_model(model) else None
+        elif LlmProviders.BYTEPLUS == provider:
+            from litellm.llms.byteplus.image_generation import (
+                get_byteplus_image_generation_config,
+            )
+
+            return get_byteplus_image_generation_config(model)
         return None
 
     @staticmethod
@@ -11335,6 +11350,12 @@ class ProviderConfigManager:
             )
 
             return DashScopeTextToSpeechConfig()
+        elif litellm.LlmProviders.BYTEPLUS == provider:
+            from litellm.llms.byteplus.text_to_speech.transformation import (
+                BytePlusTextToSpeechConfig,
+            )
+
+            return BytePlusTextToSpeechConfig()
         return None
 
     @staticmethod

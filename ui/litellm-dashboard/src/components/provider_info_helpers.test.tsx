@@ -60,6 +60,15 @@ describe("provider_info_helpers", () => {
     expect(getPlaceholder(Providers.AIAND)).toBe("aiand/openai/gpt-oss-120b");
   });
 
+  it("shows the BytePlus name, bundled logo and model placeholder", () => {
+    expect(getProviderLogoAndName("byteplus")).toEqual({
+      displayName: Providers.BYTEPLUS,
+      logo: providerLogoMap[Providers.BYTEPLUS],
+    });
+    expect(getProviderLogoAndName("byteplus").logo).toBeTruthy();
+    expect(getPlaceholder("BYTEPLUS")).toBe("byteplus/<any-model-on-byteplus>");
+  });
+
   it("maps Microsoft 365 Copilot to its chat model provider and placeholder", () => {
     expect(provider_map.MICROSOFT_365_COPILOT).toBe("microsoft_365_copilot");
     expect(getPlaceholder(Providers.MICROSOFT_365_COPILOT)).toBe("microsoft_365_copilot/chat");
