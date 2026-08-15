@@ -1003,6 +1003,7 @@ openai_compatible_providers: Final[list] = [
     "ai21_chat",
     "ai21",
     "volcengine",
+    "byteplus",
     "codestral",
     "deepseek",
     "tencent",

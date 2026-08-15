@@ -384,6 +384,7 @@ def image_generation(
             litellm.LlmProviders.QWENCLOUD,
             litellm.LlmProviders.QWEN_AI_PLATFORM,
             litellm.LlmProviders.EDENAI,
+            litellm.LlmProviders.BYTEPLUS,
         ):
             if image_generation_config is None:
                 raise ValueError(f"image generation config is not supported for {custom_llm_provider}")
@@ -402,6 +403,7 @@ def image_generation(
                 litellm_params=litellm_params_dict,
                 logging_obj=litellm_logging_obj,
                 timeout=timeout,
+                extra_headers=headers,
                 client=client,
             )
         elif custom_llm_provider == "black_forest_labs":
