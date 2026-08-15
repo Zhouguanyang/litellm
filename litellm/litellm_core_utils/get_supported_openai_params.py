@@ -96,6 +96,15 @@ def get_supported_openai_params(
         return litellm.AI21ChatConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "volcengine":
         return litellm.VolcEngineConfig().get_supported_openai_params(model=model)
+    elif custom_llm_provider == "byteplus":
+        if request_type == "embeddings":
+            embedding_config: Final = litellm.ProviderConfigManager.get_provider_embedding_config(
+                model=model,
+                provider=LlmProviders.BYTEPLUS,
+            )
+            if embedding_config is not None:
+                return embedding_config.get_supported_openai_params(model=model)
+        return litellm.BytePlusConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "groq":
         return litellm.GroqChatConfig().get_supported_openai_params(model=model)
     elif custom_llm_provider == "bedrock_mantle":
