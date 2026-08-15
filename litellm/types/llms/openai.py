@@ -1128,6 +1128,8 @@ OpenAIImageGenerationOptionalParams = Literal[
     "raw",
     "num_images",
     "image_url",
+    "image",
+    "input_references",
     "image_prompt_strength",
     "aspect_ratio",
     "imageConfig",
