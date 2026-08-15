@@ -125,6 +125,19 @@ def test_sambanova_embeddings_request_returns_list_not_none():
     assert embedding_params == []
 
 
+def test_byteplus_embeddings_request_returns_embedding_params():
+    embedding_params = get_supported_openai_params(
+        model="byteplus/doubao-embedding-large-text-250515",
+        custom_llm_provider="byteplus",
+        request_type="embeddings",
+    )
+
+    assert embedding_params is not None
+    assert "dimensions" in embedding_params
+    assert "instructions" in embedding_params
+    assert "sparse_embedding" in embedding_params
+
+
 def test_bedrock_converse_alias_resolves_like_bedrock():
     """The ``bedrock_converse`` invocation alias must resolve through AmazonConverseConfig
     just like ``bedrock`` (the codebase already pairs them, e.g. ``_strip_model_name``).
