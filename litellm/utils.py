@@ -3147,6 +3147,8 @@ def get_optional_params_image_gen(
         "style": None,
         "user": None,
         "imageConfig": None,
+        "image": None,
+        "input_references": None,
         "tools": None,
         "web_search_options": None,
     }
