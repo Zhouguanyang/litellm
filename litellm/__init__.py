@@ -1972,6 +1972,13 @@ if TYPE_CHECKING:
         VolcEngineChatConfig as VolcEngineChatConfig,
         VolcEngineChatConfig as VolcEngineConfig,
     )
+    from .llms.byteplus.chat.transformation import (
+        BytePlusChatConfig as BytePlusChatConfig,
+        BytePlusChatConfig as BytePlusConfig,
+    )
+    from .llms.byteplus.embedding.transformation import (
+        BytePlusEmbeddingConfig as BytePlusEmbeddingConfig,
+    )
     from .llms.codestral.completion.transformation import (
         CodestralTextCompletionConfig as CodestralTextCompletionConfig,
     )
