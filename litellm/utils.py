@@ -280,7 +280,7 @@ except (ImportError, AttributeError, TypeError):
 # Convert to str (if necessary)
 claude_json_str = json.dumps(json_data)
 import importlib.metadata
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, Union, cast, get_args
 
 from litellm import utils as litellm_utils
@@ -3257,15 +3257,19 @@ def register_model(
     return model_cost
 
 
-def _should_drop_param(k, additional_drop_params) -> bool:
+def _should_drop_param(k: str, additional_drop_params: Sequence[str] | None) -> bool:
     if additional_drop_params is not None and isinstance(additional_drop_params, list) and k in additional_drop_params:
         return True  # allow user to drop specific params for a model - e.g. vllm - logit bias
 
     return False
 
 
-def _get_non_default_params(passed_params: dict, default_params: dict, additional_drop_params: list | None) -> dict:
-    non_default_params: Final = {}
+def _get_non_default_params(
+    passed_params: Mapping[str, object],
+    default_params: Mapping[str, object],
+    additional_drop_params: Sequence[str] | None,
+) -> dict[str, object]:
+    non_default_params: Final[dict[str, object]] = {}
     for k, v in passed_params.items():
         if (
             k in default_params
@@ -3461,8 +3465,7 @@ def get_optional_params_image_gen(
             return non_default_params
 
     if provider_config is not None:
-        supported_params = provider_config.get_supported_openai_params(model=model or "")
-        _check_valid_arg(supported_params=supported_params)
+        _check_valid_arg(supported_params=provider_supported_params)
         optional_params = provider_config.map_openai_params(
             non_default_params=non_default_params,
             optional_params=optional_params,
@@ -3493,9 +3496,7 @@ def get_optional_params_image_gen(
         if size is not None:
             optional_params["aspectRatio"] = _map_openai_size_to_vertex_ai_aspect_ratio(size)
 
-    openai_params: Final[list[str]] = (
-        list(provider_supported_params) if provider_config is not None else list(default_params.keys())
-    )
+    openai_params: Final = provider_supported_params if provider_config is not None else tuple(default_params.keys())
 
     optional_params = add_provider_specific_params_to_optional_params(
         optional_params=optional_params,
@@ -4813,7 +4814,7 @@ def add_provider_specific_params_to_optional_params(
     optional_params: dict,
     passed_params: dict,
     custom_llm_provider: str,
-    openai_params: list[str],
+    openai_params: Collection[str],
     additional_drop_params: list | None = None,
 ) -> dict:
     """
