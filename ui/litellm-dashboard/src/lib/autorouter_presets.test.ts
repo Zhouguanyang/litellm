@@ -140,14 +140,14 @@ describe("autorouter_presets", () => {
     const config = lite.complexity_router_config;
     expect(config.classifier_type).toBe("llm");
     expect(config.classifier_llm_config).toEqual({
-      model: "deepseek-v4-flash",
+      model: "deepseek-flash",
       timeout_ms: 3000,
       classification_rubric: "agentic",
     });
     expect(config.classifier_context_window_size).toBe(0);
     expect(config.classifier_context_per_turn_chars).toBeUndefined();
     expect(getRequiredModelsInPreset(lite)).toEqual(
-      new Set(["deepseek-v4-flash", "muse-spark-1.3", "kimi-k3", "claude-opus-5-5"]),
+      new Set(["deepseek-flash", "muse-spark-1.3", "kimi-k3", "claude-opus-5-5"]),
     );
   });
 
