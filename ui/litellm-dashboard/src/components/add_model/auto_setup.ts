@@ -90,6 +90,15 @@ const parseModel = (raw: string): ModelIdentity | null => {
       ...releaseVersion(glm[1]),
       model,
     };
+  if (model === "deepseek-flash")
+    return {
+      family: "deepseek",
+      line: "flash",
+      rank: 0,
+      version: [],
+      snapshot: Number.MAX_SAFE_INTEGER,
+      model,
+    };
   const deepseek = model.match(/^deepseek-v(\d+(?:[.-]\d+)*)-(flash|pro)$/);
   if (deepseek)
     return {
@@ -158,6 +167,7 @@ const compareVersion = (left: readonly number[], right: readonly number[]): numb
 };
 
 const compareRelease = (left: ModelIdentity, right: ModelIdentity): number =>
+  Number(left.version.length === 0) - Number(right.version.length === 0) ||
   compareVersion(left.version, right.version) || left.snapshot - right.snapshot;
 
 export const routingModelGroups = (groups: readonly ModelGroup[]): ModelGroup[] =>
