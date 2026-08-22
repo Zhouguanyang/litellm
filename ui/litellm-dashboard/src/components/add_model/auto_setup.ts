@@ -12,8 +12,8 @@ export type PreferredTierModels = Record<TierName, string[]>;
 const REASONING_EFFORT_STRENGTH = ["max", "xhigh", "high", "medium", "low", "minimal", "none"] as const;
 
 const CURRENT_TIER_MODELS: PreferredTierModels = {
-  SIMPLE: ["gpt-5.6-luna", "claude-haiku-4-5", "gemini-3.5-flash-lite", "deepseek-v4-flash"],
-  MEDIUM: ["gpt-5.6-terra", "claude-sonnet-5", "gemini-3.8-flash", "deepseek-v4-flash"],
+  SIMPLE: ["gpt-5.6-luna", "claude-haiku-4-5", "gemini-3.5-flash-lite", "deepseek-flash"],
+  MEDIUM: ["gpt-5.6-terra", "claude-sonnet-5", "gemini-3.8-flash", "deepseek-flash"],
   COMPLEX: ["gpt-6-astra", "gpt-5.6-sol", "claude-opus-5", "gemini-3.1-pro-preview", "deepseek-v4-pro", "grok-4.6"],
   REASONING: ["gpt-6-astra", "gpt-5.6-sol", "claude-opus-5", "gemini-3.1-pro-preview", "deepseek-v4-pro", "grok-4.6"],
 };

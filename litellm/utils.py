@@ -2910,6 +2910,11 @@ def supports_factory(model: str, custom_llm_provider: str | None, key: str) -> b
                 model=model, custom_llm_provider=custom_llm_provider
             )
 
+        if key == "supports_vision":
+            vision_provider_override: Final = _supports_provider_info_factory(model, custom_llm_provider, key)
+            if vision_provider_override is not None:
+                return vision_provider_override
+
         model_info: Final = get_model_info_helper(model=model, custom_llm_provider=custom_llm_provider)
 
         if model_info.get(key, False) is True:
@@ -3013,6 +3018,10 @@ def is_explicitly_disabled_factory(model: str, custom_llm_provider: str | None, 
             model, custom_llm_provider, _, _ = litellm.get_llm_provider(
                 model=model, custom_llm_provider=custom_llm_provider
             )
+        if key == "supports_vision":
+            vision_provider_override: Final = _supports_provider_info_factory(model, custom_llm_provider, key)
+            if vision_provider_override is not None:
+                return False
         model_info: Final = get_model_info_helper(model=model, custom_llm_provider=custom_llm_provider)
         val: Final = model_info.get(key)
         if val is False:
@@ -6105,6 +6114,10 @@ def get_provider_info(model: str, custom_llm_provider: str | None) -> ProviderSp
     ## PROVIDER-SPECIFIC INFORMATION
     # if custom_llm_provider == "predibase":
     #     _model_info["supports_response_schema"] = True
+    is_prefixed_deepseek: Final = custom_llm_provider is None and model.startswith("deepseek/")
+    if custom_llm_provider == "deepseek" or is_prefixed_deepseek:
+        return litellm.DeepSeekChatConfig().get_provider_info(model=model)
+
     provider_config: BaseLLMModelInfo | None = None
     if custom_llm_provider and custom_llm_provider in LlmProvidersSet:
         # Check if the provider string exists in LlmProviders enum

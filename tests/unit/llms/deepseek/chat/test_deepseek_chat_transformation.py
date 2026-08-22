@@ -1,6 +1,7 @@
 import json
 from collections.abc import Iterator
 from typing import Final
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import litellm
@@ -8,6 +9,9 @@ import pytest
 import respx
 from litellm.caching.llm_caching_handler import LLMClientCache
 from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
+from litellm.types.llms.openai import AllMessageValues
+from litellm.types.utils import ModelInfoBase
+from litellm.utils import _build_model_info, is_vision_explicitly_disabled
 
 DEEPSEEK_API_BASE: Final = "https://api.deepseek.com/beta"
 DEEPSEEK_CHAT_COMPLETIONS_URL: Final = f"{DEEPSEEK_API_BASE}/chat/completions"
@@ -70,8 +74,10 @@ def _deepseek_response(stream: bool) -> httpx.Response:
     )
 
 
-def _assert_deepseek_request(request: httpx.Request, messages: list[dict[str, str]], stream: bool) -> None:
-    assert str(request.url) == DEEPSEEK_CHAT_COMPLETIONS_URL
+def _assert_deepseek_request(
+    request: httpx.Request, messages: list[AllMessageValues], stream: bool, expected_url: str
+) -> None:
+    assert str(request.url) == expected_url
     assert request.headers["Authorization"] == f"Bearer {DEEPSEEK_API_KEY}"
     actual_data: Final = json.loads(request.content)
     assert actual_data["model"] == "deepseek-reasoner"
@@ -113,6 +119,7 @@ def test_completion_cost_deepseek_reports_prompt_cache_usage(respx_mock: respx.M
         model="deepseek/deepseek-chat",
         messages=messages,
         api_key=DEEPSEEK_API_KEY,
+        api_base=DEEPSEEK_API_BASE,
         num_retries=0,
         max_retries=0,
     )
@@ -233,11 +240,76 @@ def test_thinking_mode_active_bool_thinking_returns_false_without_crashing():
     assert config._thinking_mode_active(model="deepseek-reasoner", optional_params={"thinking": True}) is False
 
 
-class TestDeepSeekVisionMultimodalContent:
-    """Image content lists are forwarded only for user messages on vision models."""
+def test_deepseek_flash_vision_capability_survives_missing_remote_model_entry():
+    with patch.dict(litellm.model_cost, {}, clear=True):
+        assert litellm.supports_vision(model="deepseek-flash", custom_llm_provider="deepseek") is True
+        assert litellm.supports_vision(model="deepseek/deepseek-flash", custom_llm_provider="deepseek") is True
+        assert litellm.supports_function_calling(model="deepseek-flash", custom_llm_provider="deepseek") is False
+        result: Final = DeepSeekChatConfig()._transform_messages(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+                        },
+                    ],
+                }
+            ],
+            model="deepseek-flash",
+        )
 
-    VISION_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
-    NON_VISION_MODEL = "deepseek/deepseek-chat"
+    assert isinstance(result[0]["content"], list)
+
+
+def test_deepseek_flash_only_overrides_remote_vision_capability():
+    remote_entry: Final[ModelInfoBase] = {
+        "litellm_provider": "deepseek",
+        "mode": "chat",
+        "input_cost_per_token": 9.1e-7,
+        "max_input_tokens": 123456,
+        "supports_function_calling": False,
+        "supports_vision": False,
+    }
+    with patch.dict(
+        litellm.model_cost,
+        {"deepseek-flash": remote_entry, "deepseek/deepseek-flash": remote_entry},
+        clear=True,
+    ):
+        assert litellm.supports_vision(model="deepseek-flash", custom_llm_provider="deepseek") is True
+        assert litellm.supports_vision(model="deepseek/deepseek-flash") is True
+        assert is_vision_explicitly_disabled(model="deepseek-flash", custom_llm_provider="deepseek") is False
+        assert is_vision_explicitly_disabled(model="deepseek/deepseek-flash") is False
+        model_info: Final = _build_model_info(model="deepseek/deepseek-flash")
+
+    assert model_info["supports_vision"] is True
+    assert model_info["input_cost_per_token"] == 9.1e-7
+    assert model_info["max_input_tokens"] == 123456
+    assert model_info["supports_function_calling"] is False
+
+
+def test_deepseek_capability_override_does_not_send_api_key_to_openai_model_discovery():
+    with patch.object(litellm.module_level_client, "get") as mock_get:
+        litellm.get_valid_models(
+            check_provider_endpoint=True,
+            custom_llm_provider="deepseek",
+            api_key="deepseek-key-must-not-reach-openai",
+        )
+
+    openai_calls: Final = tuple(
+        call for call in mock_get.call_args_list if str(call.kwargs.get("url", "")).startswith("https://api.openai.com")
+    )
+    assert openai_calls == ()
+
+
+class TestDeepSeekVisionMultimodalContent:
+    """Image content lists are forwarded only on vision models."""
+
+    VISION_MODEL = "deepseek/deepseek-flash"
+    LEGACY_VISION_MODEL = "deepseek/deepseek-v4-flash-vision-exp"
+    NON_VISION_MODEL = "deepseek/deepseek-v4-pro"
 
     def setup_method(self):
         self.config = DeepSeekChatConfig()
@@ -245,11 +317,11 @@ class TestDeepSeekVisionMultimodalContent:
         self._prior_registry_entry = dict(prior_entry) if prior_entry is not None else None
         litellm.register_model(
             {
-                "deepseek/deepseek-v4-flash-vision-exp": {
+                self.VISION_MODEL: {
                     "litellm_provider": "deepseek",
                     "mode": "chat",
-                    "input_cost_per_token": 4.4e-07,
-                    "output_cost_per_token": 1.32e-06,
+                    "input_cost_per_token": 3e-07,
+                    "output_cost_per_token": 1.2e-06,
                     "supports_vision": True,
                 }
             }
@@ -262,14 +334,14 @@ class TestDeepSeekVisionMultimodalContent:
             litellm.model_cost[self.VISION_MODEL] = self._prior_registry_entry
 
     @staticmethod
-    def _image_message(role="user"):
+    def _image_message(role="user", url="https://example.com/image.jpg"):
         return {
             "role": role,
             "content": [
                 {"type": "text", "text": "what is in this image?"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": "https://example.com/image.jpg", "detail": "auto"},
+                    "image_url": {"url": url, "detail": "auto"},
                 },
             ],
         }
@@ -282,6 +354,18 @@ class TestDeepSeekVisionMultimodalContent:
         assert result[0]["content"][1]["type"] == "image_url"
         assert result[0]["content"][1]["image_url"]["url"] == "https://example.com/image.jpg"
 
+    def test_base64_image_list_forwarded_on_current_model(self):
+        data_url = "data:image/png;base64,iVBORw0KGgo="
+
+        result = self.config._transform_messages([self._image_message(url=data_url)], model=self.VISION_MODEL)
+
+        assert result[0]["content"][1]["image_url"]["url"] == data_url
+
+    def test_legacy_vision_alias_still_forwards_images(self):
+        result = self.config._transform_messages([self._image_message()], model=self.LEGACY_VISION_MODEL)
+
+        assert isinstance(result[0]["content"], list)
+
     def test_image_list_collapsed_on_non_vision_model(self):
         result = self.config.transform_messages([self._image_message()], model=self.NON_VISION_MODEL)
 
@@ -292,6 +376,193 @@ class TestDeepSeekVisionMultimodalContent:
             result = self.config.transform_messages([self._image_message(role=role)], model=self.VISION_MODEL)
 
             assert result[0]["content"] == "what is in this image?"
+
+    def test_tool_image_list_forwarded_on_vision_model(self):
+        message = {**self._image_message(role="tool"), "tool_call_id": "call_1"}
+
+        result = self.config._transform_messages([message], model=self.VISION_MODEL)
+
+        assert result[0]["role"] == "tool"
+        assert isinstance(result[0]["content"], list)
+        assert result[0]["content"][1]["type"] == "image_url"
+
+    def test_tool_reference_removed_without_dropping_base64_image(self):
+        image_message = self._image_message(role="tool", url="data:image/png;base64,iVBORw0KGgo=")
+        message = {
+            **image_message,
+            "content": [*image_message["content"], {"type": "tool_reference", "tool_name": "vision_tool"}],
+            "tool_call_id": "call_1",
+        }
+
+        result = self.config._transform_messages([message], model=self.VISION_MODEL)
+
+        assert result[0]["content"] == message["content"][:-1]
+
+    def test_nested_file_data_without_filename_does_not_get_pdf_filename(self):
+        data_url = "data:image/png;base64,iVBORw0KGgo="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {
+                        "type": "file",
+                        "file": {"file_data": data_url},
+                    },
+                ],
+            }
+        ]
+
+        result = self.config._transform_messages(messages, model=self.VISION_MODEL)
+
+        assert result[0]["content"][1] == {
+            "type": "file",
+            "file_data": data_url,
+        }
+
+    def test_flat_file_data_block_forwarded_for_deepseek(self):
+        data_url = "data:image/png;base64,iVBORw0KGgo="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "file", "file_data": data_url, "filename": "image.png"},
+                ],
+            }
+        ]
+
+        result = self.config._transform_messages(messages, model=self.VISION_MODEL)
+
+        assert result[0]["content"][1] == messages[0]["content"][1]
+
+    def test_nested_file_id_block_flattened_for_deepseek(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "file", "file": {"file_id": "file-api-123"}},
+                ],
+            }
+        ]
+
+        result = self.config._transform_messages(messages, model=self.VISION_MODEL)
+
+        assert result[0]["content"][1] == {"type": "file", "file_id": "file-api-123"}
+
+    def test_remote_file_url_converted_before_flattening(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "summarize this file"},
+                    {"type": "file", "file": {"file_id": "https://example.com/document.pdf"}},
+                ],
+            }
+        ]
+        data_url = "data:application/pdf;base64,JVBERi0="
+
+        with patch(
+            "litellm.llms.openai.chat.gpt_transformation.convert_url_to_base64",
+            return_value=data_url,
+        ) as convert:
+            result = self.config._transform_messages(messages, model=self.VISION_MODEL)
+
+        convert.assert_called_once_with("https://example.com/document.pdf")
+        assert result[0]["content"][1] == {
+            "type": "file",
+            "file_data": data_url,
+            "filename": "my_file.pdf",
+        }
+
+    async def test_async_remote_file_url_converted_before_flattening(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "summarize this file"},
+                    {"type": "file", "file": {"file_id": "https://example.com/document.pdf"}},
+                ],
+            }
+        ]
+        data_url = "data:application/pdf;base64,JVBERi0="
+        convert = AsyncMock(return_value=data_url)
+
+        with (
+            patch(
+                "litellm.llms.openai.chat.gpt_transformation.async_convert_url_to_base64",
+                convert,
+            ),
+            patch("litellm.llms.openai.chat.gpt_transformation.convert_url_to_base64") as sync_convert,
+        ):
+            result = await self.config.async_transform_request(
+                model=self.VISION_MODEL,
+                messages=messages,
+                optional_params={},
+                litellm_params={},
+                headers={},
+            )
+
+        convert.assert_awaited_once_with("https://example.com/document.pdf")
+        sync_convert.assert_not_called()
+        assert result["messages"][0]["content"][1] == {
+            "type": "file",
+            "file_data": data_url,
+            "filename": "my_file.pdf",
+        }
+
+    def test_tool_file_data_block_flattened_for_deepseek(self):
+        data_url = "data:image/png;base64,iVBORw0KGgo="
+        messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "tool image"},
+                    {
+                        "type": "file",
+                        "file": {"file_data": data_url, "filename": "image.png"},
+                    },
+                ],
+            }
+        ]
+
+        result = self.config._transform_messages(messages, model=self.VISION_MODEL)
+
+        assert result[0]["content"][1] == {
+            "type": "file",
+            "file_data": data_url,
+            "filename": "image.png",
+        }
+
+    def test_malformed_file_block_collapsed(self):
+        for file_payload in (
+            {},
+            {"file_data": "data:image/png;base64,AAAA", "file_id": "file-api-123"},
+            {"file_id": "file-api-123", "filename": "image.png"},
+        ):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is in this image?"},
+                        {"type": "file", "file": file_payload},
+                    ],
+                }
+            ]
+
+            result = self.config._transform_messages(messages, model=self.VISION_MODEL)
+
+            assert result[0]["content"] == "what is in this image?"
+
+    def test_malformed_media_only_block_collapsed_without_crashing(self):
+        for media_block in ({"type": "image_url"}, {"type": "file", "file": {}}):
+            messages = [{"role": "user", "content": [media_block]}]
+
+            result = self.config._transform_messages(messages, model=self.VISION_MODEL)
+
+            assert result[0]["content"] == ""
 
     def test_audio_block_collapsed_even_on_vision_model(self):
         messages = [
@@ -510,6 +781,32 @@ class TestDeepSeekVisionMultimodalContent:
         assert isinstance(content, list)
         assert any(block.get("type") == "image_url" for block in content)
 
+    async def test_async_file_data_without_filename_does_not_get_pdf_filename(self):
+        data_url = "data:image/png;base64,iVBORw0KGgo="
+        body = await self.config.async_transform_request(
+            model=self.VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is in this image?"},
+                        {
+                            "type": "file",
+                            "file": {"file_data": data_url},
+                        },
+                    ],
+                }
+            ],
+            optional_params={},
+            litellm_params={},
+            headers={},
+        )
+
+        assert body["messages"][0]["content"][1] == {
+            "type": "file",
+            "file_data": data_url,
+        }
+
 
 class TestDeepSeekThinkingParams:
     """Test thinking and reasoning_effort parameter handling for DeepSeek."""
@@ -716,70 +1013,50 @@ def test_deepseek_mock_completion(stream):
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("prefill", "api_base", "expected_url"),
+    (
+        (False, None, "https://api.deepseek.com/chat/completions"),
+        (True, None, "https://api.deepseek.com/beta/chat/completions"),
+        (False, "https://proxy.example.com/v1", "https://proxy.example.com/v1/chat/completions"),
+        (True, "https://proxy.example.com/v1", "https://proxy.example.com/v1/chat/completions"),
+    ),
+)
+@pytest.mark.usefixtures("_deepseek_httpx_transport")
 @pytest.mark.asyncio
-async def test_deepseek_provider_async_completion(stream):
-    """
-    Test that Deepseek provider requests are formatted correctly with the proper parameters
-    """
-    import json
-    from unittest.mock import MagicMock, patch
-
-    import litellm
-    from litellm import acompletion
-
-    litellm.turn_on_debug()
-
-    # Set up the test parameters
-    api_key = "fake_api_key"
-    model = "deepseek/deepseek-reasoner"
-    messages = [{"role": "user", "content": "Hello, world!"}]
-
-    # Mock AsyncHTTPHandler.post method for async test
-    with patch(
-        "litellm.llms.custom_httpx.llm_http_handler.AsyncHTTPHandler.post"
-    ) as mock_post:
-        mock_response_data = litellm.ModelResponse(
-            choices=[
-                litellm.Choices(
-                    message=litellm.Message(content="Hello!"),
-                    index=0,
-                    finish_reason="stop",
-                )
-            ]
-        ).model_dump()
-        # Create a proper mock response
-        mock_response = MagicMock()  # Use MagicMock instead of AsyncMock
-        mock_response.status_code = 200
-        mock_response.text = json.dumps(mock_response_data)
-        mock_response.headers = {"Content-Type": "application/json"}
-
-        # Make json() return a value directly, not a coroutine
-        mock_response.json.return_value = mock_response_data
-
-        # Set the return value for the post method
-        mock_post.return_value = mock_response
-
-        await acompletion(
-            custom_llm_provider="deepseek",
-            api_key=api_key,
-            model=model,
+async def test_deepseek_provider_async_completion(
+    stream: bool,
+    prefill: bool,
+    api_base: str | None,
+    expected_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_BASE", raising=False)
+    messages: Final[list[AllMessageValues]] = (
+        [
+            {"role": "user", "content": "Write quick sort code"},
+            {"role": "assistant", "content": "```python\n", "prefix": True},
+        ]
+        if prefill
+        else [{"role": "user", "content": "Hello, world!"}]
+    )
+    with respx.mock as router:
+        route: Final = router.post(expected_url).mock(return_value=_deepseek_response(stream))
+        response: Final = await litellm.acompletion(
+            model="deepseek/deepseek-reasoner",
             messages=messages,
+            api_key=DEEPSEEK_API_KEY,
+            api_base=api_base,
             stream=stream,
         )
+        if stream:
+            content: Final = "".join([chunk.choices[0].delta.content or "" async for chunk in response])
+            assert content == "Hello!"
+        else:
+            assert response.choices[0].message.content == "Hello!"
 
-    # Verify the request was made with the correct parameters
-    mock_post.assert_called_once()
-    call_args = mock_post.call_args
-    print("request call=", json.dumps(call_args.kwargs, indent=4, default=str))
-
-    # Check request body
-    request_body = json.loads(call_args.kwargs["data"])
-    assert call_args.kwargs["url"] == "https://api.deepseek.com/beta/chat/completions"
-    assert (
-        request_body["model"] == "deepseek-reasoner"
-    )  # Model name should be stripped of provider prefix
-    assert request_body["messages"] == messages
-    assert request_body["stream"] == stream
+        assert route.call_count == 1
+        _assert_deepseek_request(route.calls[0].request, messages, stream, expected_url)
 
 
 def test_deepseek_fill_reasoning_content_multiturn():
