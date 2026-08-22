@@ -133,8 +133,8 @@ describe("buildAutomaticRouterConfig", () => {
     },
     {
       provider: "DeepSeek",
-      available: ["deepseek-v4-flash", "deepseek-v4-pro"],
-      expected: ["deepseek-v4-flash", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-pro"],
+      available: ["deepseek-flash", "deepseek-v4-pro"],
+      expected: ["deepseek-flash", "deepseek-flash", "deepseek-v4-pro", "deepseek-v4-pro"],
       supportedEfforts: ["none", "high"],
       effort: "high",
     },
