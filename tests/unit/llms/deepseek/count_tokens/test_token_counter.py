@@ -265,7 +265,7 @@ async def test_count_without_messages_leaves_the_count_to_the_estimate() -> None
 
 @pytest.mark.asyncio
 async def test_messages_count_rejects_an_effort_messages_inference_rejects_without_calling_deepseek() -> None:
-    options: Final[dict[str, JsonValue]] = {"output_config": {"effort": "unlisted"}}
+    options: Final[dict[str, JsonValue]] = {"reasoning_effort": "unlisted"}
     with pytest.raises(AnthropicError) as rejected:
         DeepSeekAnthropicMessagesConfig().transform_anthropic_messages_request(
             model="deepseek-v4-pro",

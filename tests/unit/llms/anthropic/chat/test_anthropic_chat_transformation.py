@@ -33,13 +33,13 @@ from litellm.litellm_core_utils.prompt_templates.reasoning_utils import (
     encrypted_reasoning_signature,
 )
 from litellm.llms.anthropic.chat import ModelResponseIterator
+from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 from litellm.llms.anthropic.common_utils import (
     AnthropicError,
     anthropic_server_tool_call_params,
     process_anthropic_headers,
     validated_object_mapping,
 )
-from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 from litellm.llms.anthropic.messages.native.transformation import (
     AnthropicMessagesConfig,
 )
@@ -656,6 +656,43 @@ def test_server_tool_use_usage():
     }
     usage = config.calculate_usage(usage_object=usage_object, reasoning_content=None)
     assert usage.server_tool_use.web_search_requests == 1
+
+
+def test_server_tool_use_preserves_deepseek_and_fetch_counters():
+    config = AnthropicConfig()
+
+    usage = config.calculate_usage(
+        usage_object={
+            "input_tokens": 2912,
+            "output_tokens": 52,
+            "server_tool_use": {
+                "web_search_requests": 2,
+                "tool_search": 1,
+                "web_fetch_requests": 3,
+                "tool_fetch": 2,
+                "tool_image_search": 1,
+            },
+        },
+        reasoning_content=None,
+    )
+
+    assert usage.server_tool_use == ServerToolUse(
+        web_search_requests=2,
+        tool_search=1,
+        web_fetch_requests=3,
+        tool_fetch=2,
+        tool_image_search=1,
+    )
+
+    only_fetch = config.calculate_usage(
+        usage_object={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "server_tool_use": {"tool_fetch": 1, "tool_search": True},
+        },
+        reasoning_content=None,
+    )
+    assert only_fetch.server_tool_use == ServerToolUse(tool_fetch=1)
 
 
 def test_web_search_tool_transformation():

@@ -11,6 +11,10 @@ field set to ``True``.
 
 import json
 import os
+from pathlib import Path
+from typing import Final
+
+import pytest
 
 import litellm
 from litellm.utils import (
@@ -20,6 +24,19 @@ from litellm.utils import (
 # ---------------------------------------------------------------------------
 # Data-level tests – verify the JSON files are in sync
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "map_filename",
+    ("model_prices_and_context_window.json", "litellm/model_prices_and_context_window_backup.json"),
+)
+def test_deepseek_flash_aliases_advertise_all_supported_proxy_endpoints(map_filename: str) -> None:
+    map_path: Final = Path(__file__).parents[2] / map_filename
+    cost_map: Final = json.loads(map_path.read_text(encoding="utf-8"))
+    expected_endpoints: Final = frozenset(("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+
+    assert frozenset(cost_map["deepseek-flash"]["supported_endpoints"]) == expected_endpoints
+    assert frozenset(cost_map["deepseek/deepseek-flash"]["supported_endpoints"]) == expected_endpoints
 
 
 def _load_backup_json() -> dict:

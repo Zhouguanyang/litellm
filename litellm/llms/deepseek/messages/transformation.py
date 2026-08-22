@@ -8,7 +8,11 @@ from typing import Final
 from pydantic import TypeAdapter
 
 import litellm
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
+from litellm.litellm_core_utils.reasoning_effort_utils import warn_non_string_reasoning_effort
 from litellm.litellm_core_utils.url_utils import join_api_base
+from litellm.llms.anthropic.chat.transformation import REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT
+from litellm.llms.anthropic.common_utils import AnthropicError
 from litellm.llms.anthropic.messages.native.transformation import (
     AnthropicMessagesConfig,
 )
@@ -18,6 +22,57 @@ from litellm.types.router import GenericLiteLLMParams
 _TOOL_LIST: Final = TypeAdapter(list[object])
 _REQUEST_FIELDS: Final = TypeAdapter(dict[str, object])
 _TOOL_FIELDS: Final = TypeAdapter(dict[object, object])
+
+
+def _without_output_config_effort(params: Mapping[str, object]) -> Mapping[str, object]:
+    output_config: Final = as_str_mapping(params.get("output_config"))
+    if output_config is None or "effort" not in output_config:
+        return params
+    residual: Final = {key: value for key, value in output_config.items() if key != "effort"}
+    without_output_config: Final = {key: value for key, value in params.items() if key != "output_config"}
+    return {**without_output_config, "output_config": residual} if residual else without_output_config
+
+
+def _with_default_output_config_effort(params: Mapping[str, object], effort: str) -> Mapping[str, object]:
+    existing: Final = as_str_mapping(params.get("output_config"))
+    merged_output_config: Final = {"effort": effort, **(existing or {})}
+    return {**params, "output_config": merged_output_config}
+
+
+def _normalize_deepseek_reasoning_effort(
+    params: Mapping[str, object],
+    model: str,
+    *,
+    report_reasoning_drops: bool,
+) -> Mapping[str, object]:
+    if "reasoning_effort" not in params:
+        return params
+    reasoning_effort: Final = params["reasoning_effort"]
+    without_effort: Final = {key: value for key, value in params.items() if key != "reasoning_effort"}
+    if not isinstance(reasoning_effort, str):
+        if report_reasoning_drops:
+            warn_non_string_reasoning_effort(reasoning_effort, model)
+        return without_effort
+    if reasoning_effort == "none":
+        return {**_without_output_config_effort(without_effort), "thinking": {"type": "disabled"}}
+    mapped_effort: Final = REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT.get(reasoning_effort)
+    if mapped_effort is None:
+        raise AnthropicError(
+            message=(
+                f"Invalid reasoning_effort: {reasoning_effort!r}. "
+                f"Must be one of: 'minimal', 'low', 'medium', 'high', "
+                f"'xhigh', 'max', 'none'"
+            ),
+            status_code=400,
+        )
+    thinking: Final = without_effort.get("thinking")
+    thinking_dict: Final = as_str_mapping(thinking)
+    if thinking_dict is not None and thinking_dict.get("type") == "disabled":
+        return without_effort
+    with_thinking: Final = (
+        without_effort if thinking is not None else {**without_effort, "thinking": {"type": "enabled"}}
+    )
+    return _with_default_output_config_effort(with_thinking, mapped_effort)
 
 
 def _custom_tool_without_type(tool: object) -> Mapping[object, object] | None:
@@ -119,6 +174,32 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
     ) -> str:
         return join_api_base(deepseek_anthropic_base(api_base), "v1/messages")
 
+    @staticmethod
+    def _translate_reasoning_effort_to_anthropic(
+        model: str,
+        optional_params: Mapping[str, object],
+        max_tokens: int | None,
+        custom_llm_provider: str,
+    ) -> None:
+        return None
+
+    @staticmethod
+    def _translate_adaptive_effort_for_non_adaptive_model(
+        model: str,
+        optional_params: Mapping[str, object],
+        max_tokens: int | None,
+        custom_llm_provider: str,
+    ) -> None:
+        return None
+
+    @staticmethod
+    def _drop_incompatible_temperature_for_thinking(
+        model: str,
+        optional_params: Mapping[str, object],
+        custom_llm_provider: str,
+    ) -> None:
+        return None
+
     def transform_anthropic_messages_request(
         self,
         model: str,
@@ -131,7 +212,17 @@ class DeepSeekAnthropicMessagesConfig(AnthropicMessagesConfig):
             super().transform_anthropic_messages_request(
                 model=model,
                 messages=messages,
-                anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+                anthropic_messages_optional_request_params=(
+                    dict(
+                        _normalize_deepseek_reasoning_effort(
+                            _REQUEST_FIELDS.validate_python(anthropic_messages_optional_request_params),
+                            model=model,
+                            report_reasoning_drops=self._report_reasoning_drops,
+                        )
+                    )
+                    if "reasoning_effort" in anthropic_messages_optional_request_params
+                    else anthropic_messages_optional_request_params
+                ),
                 litellm_params=litellm_params,
                 headers=headers,
             )
