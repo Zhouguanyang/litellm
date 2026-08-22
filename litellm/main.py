@@ -1480,7 +1480,19 @@ def _complete_azure_text(ctx: _CompletionDispatchContext) -> _CompletionDispatch
 
 def _complete_deepseek(ctx: _CompletionDispatchContext) -> _CompletionDispatchResult:
     acompletion: Final = ctx.acompletion
-    api_base: Final = ctx.api_base
+    last_message: Final = ctx.messages[-1] if ctx.messages else None
+    uses_assistant_prefill: Final = (
+        isinstance(last_message, dict)
+        and last_message.get("role") == "assistant"
+        and last_message.get("prefix") is True
+    )
+    default_api_base: Final = "https://api.deepseek.com"
+    api_base: Final = (
+        f"{default_api_base}/beta"
+        if uses_assistant_prefill
+        and (ctx.api_base is None or ctx.api_base.rstrip("/") == default_api_base)
+        else ctx.api_base
+    )
     api_key: Final = ctx.api_key
     client: Final = _dispatch_client_http(ctx)
     custom_llm_provider: Final = ctx.custom_llm_provider

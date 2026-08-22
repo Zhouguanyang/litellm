@@ -3975,13 +3975,13 @@ class TestValidateAndFixThinkingParam:
         assert validate_and_fix_thinking_param(thinking=False) is None
 
 
-def test_deepseek_v4_models_in_cost_map():
+def test_deepseek_models_in_cost_map():
     """
-    Test that deepseek-v4-flash and deepseek-v4-pro entries are correctly
+    Test that current and legacy DeepSeek entries are correctly
     configured in model_prices_and_context_window.json.
 
     Prices sourced from https://api-docs.deepseek.com/quick_start/pricing:
-    - deepseek-v4-flash: $0.44/M input, $1.32/M output
+    - deepseek-flash:  $0.30/M input, $1.20/M output
     - deepseek-v4-pro:   $1.32/M input, $3.96/M output
 
     Closes https://github.com/BerriAI/litellm/issues/26709
@@ -3994,9 +3994,11 @@ def test_deepseek_v4_models_in_cost_map():
         model_cost = json.load(f)
 
     # --- bare model names ---
-    for key, expected_input, expected_output, expected_cache in [
-        ("deepseek-v4-flash", 4.4e-07, 1.32e-06, 1.4e-08),
-        ("deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08),
+    for key, expected_input, expected_output, expected_cache, expected_vision in [
+        ("deepseek-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek-v4-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek-v4-flash-vision-exp", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08, False),
     ]:
         info = model_cost.get(key)
         assert info is not None, f"{key} missing from model_prices_and_context_window.json"
@@ -4008,11 +4010,14 @@ def test_deepseek_v4_models_in_cost_map():
         assert info["max_input_tokens"] == 1_000_000
         assert info["supports_function_calling"] is True
         assert info["supports_tool_choice"] is True
+        assert info["supports_vision"] is expected_vision
 
     # --- provider-prefixed names ---
-    for key, expected_input, expected_output, expected_cache in [
-        ("deepseek/deepseek-v4-flash", 4.4e-07, 1.32e-06, 1.4e-08),
-        ("deepseek/deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08),
+    for key, expected_input, expected_output, expected_cache, expected_vision in [
+        ("deepseek/deepseek-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek/deepseek-v4-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek/deepseek-v4-flash-vision-exp", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek/deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08, False),
     ]:
         info = model_cost.get(key)
         assert info is not None, f"{key} missing from model_prices_and_context_window.json"
@@ -4023,11 +4028,18 @@ def test_deepseek_v4_models_in_cost_map():
         assert info["cache_read_input_token_cost"] == expected_cache
         assert info["supports_function_calling"] is True
         assert info["supports_tool_choice"] is True
+        assert info["supports_vision"] is expected_vision
+
+    expected_endpoints = {"/v1/chat/completions", "/v1/responses", "/v1/messages"}
+    assert set(model_cost["deepseek-flash"]["supported_endpoints"]) == expected_endpoints
+    assert set(model_cost["deepseek/deepseek-flash"]["supported_endpoints"]) == expected_endpoints
+    assert model_cost["deepseek-v4-pro"]["deprecation_date"] == "2026-09-14"
+    assert model_cost["deepseek/deepseek-v4-pro"]["deprecation_date"] == "2026-09-14"
 
 
-def test_deepseek_v4_models_in_backup_cost_map():
+def test_deepseek_models_in_backup_cost_map():
     """
-    Test that deepseek-v4-flash and deepseek-v4-pro entries are correctly
+    Test that current and legacy DeepSeek entries are correctly
     configured in litellm/model_prices_and_context_window_backup.json.
     """
     import json
@@ -4038,9 +4050,11 @@ def test_deepseek_v4_models_in_backup_cost_map():
         model_cost = json.load(f)
 
     # --- bare model names ---
-    for key, expected_input, expected_output, expected_cache in [
-        ("deepseek-v4-flash", 4.4e-07, 1.32e-06, 1.4e-08),
-        ("deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08),
+    for key, expected_input, expected_output, expected_cache, expected_vision in [
+        ("deepseek-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek-v4-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek-v4-flash-vision-exp", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08, False),
     ]:
         info = model_cost.get(key)
         assert info is not None, f"{key} missing from backup JSON"
@@ -4050,11 +4064,14 @@ def test_deepseek_v4_models_in_backup_cost_map():
         assert info["output_cost_per_token"] == expected_output
         assert info["cache_read_input_token_cost"] == expected_cache
         assert info["max_input_tokens"] == 1_000_000
+        assert info["supports_vision"] is expected_vision
 
     # --- provider-prefixed names ---
-    for key, expected_input, expected_output, expected_cache in [
-        ("deepseek/deepseek-v4-flash", 4.4e-07, 1.32e-06, 1.4e-08),
-        ("deepseek/deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08),
+    for key, expected_input, expected_output, expected_cache, expected_vision in [
+        ("deepseek/deepseek-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek/deepseek-v4-flash", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek/deepseek-v4-flash-vision-exp", 3e-07, 1.2e-06, 6e-09, True),
+        ("deepseek/deepseek-v4-pro", 1.32e-06, 3.96e-06, 4.4e-08, False),
     ]:
         info = model_cost.get(key)
         assert info is not None, f"{key} missing from backup JSON"
@@ -4063,6 +4080,10 @@ def test_deepseek_v4_models_in_backup_cost_map():
         assert info["input_cost_per_token"] == expected_input
         assert info["output_cost_per_token"] == expected_output
         assert info["cache_read_input_token_cost"] == expected_cache
+        assert info["supports_vision"] is expected_vision
+
+    assert model_cost["deepseek-v4-pro"]["deprecation_date"] == "2026-09-14"
+    assert model_cost["deepseek/deepseek-v4-pro"]["deprecation_date"] == "2026-09-14"
 
 
 _FIREWORKS_MODELS = [
