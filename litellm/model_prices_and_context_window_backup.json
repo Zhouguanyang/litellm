@@ -4999,6 +4999,7 @@
         "supports_vision": true
     },
     "azure/gpt-4o": {
+        "deprecation_date": "2027-04-14",
         "cache_read_input_token_cost": 1.25e-06,
         "input_cost_per_token": 2.5e-06,
         "litellm_provider": "azure",
@@ -5541,6 +5542,7 @@
         "supports_tool_choice": true
     },
     "azure/gpt-4o-mini-transcribe": {
+        "deprecation_date": "2027-06-15",
         "input_cost_per_audio_token": 1.25e-06,
         "input_cost_per_token": 1.25e-06,
         "litellm_provider": "azure",
@@ -5553,6 +5555,7 @@
         ]
     },
     "azure/gpt-4o-mini-tts": {
+        "deprecation_date": "2027-06-15",
         "input_cost_per_token": 2.5e-06,
         "litellm_provider": "azure",
         "mode": "audio_speech",
