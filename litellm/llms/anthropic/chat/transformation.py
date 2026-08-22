@@ -31,6 +31,7 @@ from litellm.constants import (
 )
 from litellm.litellm_core_utils.asyncify import is_event_loop_running
 from litellm.litellm_core_utils.core_helpers import (
+    as_str_mapping,
     coerce_token_limit,
     drops_unsupported_params,
     map_finish_reason,
@@ -360,6 +361,51 @@ def _hosted_web_tool_use(block: object) -> tuple[str, str, object] | None:
             return call_id, name, tool_input
         case _:
             return None
+
+
+ANTHROPIC_SERVER_TOOL_USE_FIELDS: Final = (
+    "web_search_requests",
+    "tool_search_requests",
+    "web_fetch_requests",
+    "tool_search",
+    "tool_fetch",
+    "tool_image_search",
+)
+_SERVER_TOOL_CONTENT_BLOCKS: Final = TypeAdapter(tuple[object, ...])
+
+
+def extract_server_tool_use_counts(raw_server_tool_use: object) -> Mapping[str, int]:
+    fields: Final = as_str_mapping(raw_server_tool_use)
+    if fields is None:
+        return MappingProxyType({})
+    return MappingProxyType(
+        {
+            field: value
+            for field in ANTHROPIC_SERVER_TOOL_USE_FIELDS
+            if isinstance((value := fields.get(field)), int) and not isinstance(value, bool)
+        }
+    )
+
+
+def _is_tool_search_block(block: object) -> bool:
+    fields: Final = as_str_mapping(block)
+    if fields is None or fields.get("type") != "server_tool_use":
+        return False
+    name: Final = fields.get("name")
+    return isinstance(name, str) and "tool_search" in name
+
+
+def _count_tool_search_blocks(completion_response: object) -> int | None:
+    response_fields: Final = as_str_mapping(completion_response)
+    if response_fields is None:
+        return None
+    raw_content: Final = response_fields.get("content")
+    if not isinstance(raw_content, Sequence) or isinstance(raw_content, (str, bytes)):
+        return None
+    count: Final = sum(
+        1 for block in _SERVER_TOOL_CONTENT_BLOCKS.validate_python(raw_content) if _is_tool_search_block(block)
+    )
+    return count if count > 0 else None
 
 
 def _server_tool_use_id(block: object) -> str | None:
@@ -3001,8 +3047,6 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         cache_creation_input_tokens: int = 0
         cache_read_input_tokens: int = 0
         cache_creation_token_details: Final = self._resolve_cache_creation_token_details(_usage)
-        web_search_requests: int | None = None
-        tool_search_requests: int | None = None
         inference_geo: str | None = None
         if "inference_geo" in _usage and _usage["inference_geo"] is not None:
             inference_geo = _usage["inference_geo"]
@@ -3028,29 +3072,26 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             if "cache_read_input_tokens" in _usage and _usage["cache_read_input_tokens"] is not None:
                 cache_read_input_tokens = _usage["cache_read_input_tokens"]
                 prompt_tokens += cache_read_input_tokens
-        if "server_tool_use" in _usage and _usage["server_tool_use"] is not None:
-            if (
-                "web_search_requests" in _usage["server_tool_use"]
-                and _usage["server_tool_use"]["web_search_requests"] is not None
-            ):
-                web_search_requests = cast(int, _usage["server_tool_use"]["web_search_requests"])
-            if (
-                "tool_search_requests" in _usage["server_tool_use"]
-                and _usage["server_tool_use"]["tool_search_requests"] is not None
-            ):
-                tool_search_requests = cast(int, _usage["server_tool_use"]["tool_search_requests"])
 
-        # Count tool_search_requests from content blocks if not in usage
-        # Anthropic doesn't always include tool_search_requests in the usage object
-        if tool_search_requests is None and completion_response is not None:
-            tool_search_count = 0
-            for content in completion_response.get("content", []):
-                if content.get("type") == "server_tool_use":
-                    tool_name = content.get("name", "")
-                    if "tool_search" in tool_name:
-                        tool_search_count += 1
-            if tool_search_count > 0:
-                tool_search_requests = tool_search_count
+        server_tool_use_counts: Final = extract_server_tool_use_counts(_usage.get("server_tool_use"))
+        fallback_tool_search_requests: Final = (
+            _count_tool_search_blocks(completion_response)
+            if "tool_search_requests" not in server_tool_use_counts and completion_response is not None
+            else None
+        )
+        tool_search_requests: Final = server_tool_use_counts.get("tool_search_requests", fallback_tool_search_requests)
+        server_tool_use: Final = (
+            ServerToolUse(
+                web_search_requests=server_tool_use_counts.get("web_search_requests"),
+                tool_search_requests=tool_search_requests,
+                web_fetch_requests=server_tool_use_counts.get("web_fetch_requests"),
+                tool_search=server_tool_use_counts.get("tool_search"),
+                tool_fetch=server_tool_use_counts.get("tool_fetch"),
+                tool_image_search=server_tool_use_counts.get("tool_image_search"),
+            )
+            if server_tool_use_counts or tool_search_requests is not None
+            else None
+        )
 
         raw_input_tokens: Final = prompt_tokens - cache_read_input_tokens - cache_creation_input_tokens
         prompt_tokens_details: Final = PromptTokensDetailsWrapper(
@@ -3077,14 +3118,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             cache_read_input_tokens=cache_read_input_tokens,
             completion_tokens_details=completion_token_details,
             iterations=iterations,
-            server_tool_use=(
-                ServerToolUse(
-                    web_search_requests=web_search_requests,
-                    tool_search_requests=tool_search_requests,
-                )
-                if (web_search_requests is not None or tool_search_requests is not None)
-                else None
-            ),
+            server_tool_use=server_tool_use,
             inference_geo=inference_geo,
             speed=resolved_speed,
             service_tier=service_tier,

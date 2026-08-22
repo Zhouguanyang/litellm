@@ -1,6 +1,8 @@
 import codecs
 import json
 from collections.abc import Mapping, Sequence
+from functools import reduce
+from itertools import chain
 from types import MappingProxyType
 from typing import Final
 
@@ -14,7 +16,10 @@ from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import is_str_keyed
 from litellm.llms.anthropic.chat.handler import (
     ModelResponseIterator as AnthropicModelResponseIterator,
 )
-from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+from litellm.llms.anthropic.chat.transformation import (
+    AnthropicConfig,
+    extract_server_tool_use_counts,
+)
 from litellm.llms.anthropic.messages.native.utils import MESSAGE_DELTA_OPTIONAL_KEYS
 from litellm.llms.custom_httpx.sse_lines import split_sse_lines
 from litellm.types.utils import (
@@ -310,6 +315,30 @@ def extract_sse_data(event_str: str) -> dict | None:
     return decoded if is_str_keyed_dict(decoded) else None
 
 
+def _extract_event_server_tool_use(event_str: str) -> Mapping[str, int]:
+    if "message_delta" not in event_str:
+        return MappingProxyType({})
+    data: Final = _sse_event_data(event_str)
+    if data is None or data.get("type") != "message_delta":
+        return MappingProxyType({})
+    usage: Final = as_str_mapping(data.get("usage"))
+    if usage is None:
+        return MappingProxyType({})
+    return extract_server_tool_use_counts(usage.get("server_tool_use"))
+
+
+def _merge_server_tool_use_counts(acc: Mapping[str, int], counts: Mapping[str, int]) -> Mapping[str, int]:
+    if not counts:
+        return acc
+    return MappingProxyType({**acc, **counts})
+
+
+def _collect_server_tool_use_counts(all_chunks: Sequence[str | bytes]) -> Mapping[str, int]:
+    events: Final = chain.from_iterable(map(split_sse_chunk_into_events, all_chunks))
+    empty: Final[Mapping[str, int]] = MappingProxyType({})
+    return reduce(_merge_server_tool_use_counts, map(_extract_event_server_tool_use, events), empty)
+
+
 def build_usage_only_response_from_chunks(
     all_chunks: Sequence[str | bytes],
     model: str,
@@ -330,8 +359,6 @@ def build_usage_only_response_from_chunks(
     cache_creation_5m: int | None = None
     cache_creation_1h: int | None = None
     output_tokens = 0
-    web_search_requests: int | None = None
-    tool_search_requests: int | None = None
     inference_geo: str | None = None
     speed_from_stream: str | None = None
     stop_reason: str | None = None
@@ -369,12 +396,6 @@ def build_usage_only_response_from_chunks(
                 usage = data.get("usage") or {}
                 if usage.get("output_tokens") is not None:
                     output_tokens = usage.get("output_tokens")
-                _stu = usage.get("server_tool_use")
-                if isinstance(_stu, dict):
-                    if _stu.get("web_search_requests") is not None:
-                        web_search_requests = _stu.get("web_search_requests")
-                    if _stu.get("tool_search_requests") is not None:
-                        tool_search_requests = _stu.get("tool_search_requests")
                 if usage.get("cache_read_input_tokens") is not None:
                     cache_read = usage.get("cache_read_input_tokens")
                 if usage.get("inference_geo") is not None:
@@ -403,13 +424,9 @@ def build_usage_only_response_from_chunks(
             "ephemeral_5m_input_tokens": cache_creation_5m or 0,
             "ephemeral_1h_input_tokens": cache_creation_1h or 0,
         }
-    if web_search_requests is not None or tool_search_requests is not None:
-        _server_tool_use: Final[dict] = {}
-        if web_search_requests is not None:
-            _server_tool_use["web_search_requests"] = web_search_requests
-        if tool_search_requests is not None:
-            _server_tool_use["tool_search_requests"] = tool_search_requests
-        usage_object["server_tool_use"] = _server_tool_use
+    server_tool_use_counts: Final = _collect_server_tool_use_counts(all_chunks)
+    if server_tool_use_counts:
+        usage_object["server_tool_use"] = dict(server_tool_use_counts)
     if inference_geo is not None:
         usage_object["inference_geo"] = inference_geo
     if speed_from_stream is not None:

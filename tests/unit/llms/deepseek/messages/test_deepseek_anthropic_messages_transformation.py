@@ -1,4 +1,7 @@
+import pytest
+
 import litellm
+from litellm.llms.anthropic.common_utils import AnthropicError
 from litellm.llms.anthropic.messages.native.transformation import (
     AnthropicMessagesConfig,
 )
@@ -187,3 +190,221 @@ def test_deepseek_anthropic_messages_preserves_thinking_and_sanitizes_custom_too
         "input_schema": {"type": "object"},
     }
     assert request["tools"][1]["type"] == "web_search_20260209"
+
+
+def test_deepseek_anthropic_messages_preserves_native_web_tools():
+    config = DeepSeekAnthropicMessagesConfig()
+    tools = [
+        {"type": "deepseek_web_search", "name": "deepseek_web_search"},
+        {"type": "deepseek_read_url", "name": "deepseek_read_url"},
+        {
+            "type": "custom",
+            "name": "get_weather",
+            "input_schema": {"type": "object"},
+        },
+    ]
+
+    request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "Check latest updates."}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 256,
+            "tools": tools,
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert request["tools"] == [
+        {"type": "deepseek_web_search", "name": "deepseek_web_search"},
+        {"type": "deepseek_read_url", "name": "deepseek_read_url"},
+        {"name": "get_weather", "input_schema": {"type": "object"}},
+    ]
+
+
+def test_deepseek_server_tool_use_adds_no_per_call_surcharge():
+    from litellm.types.utils import Choices, Message, ModelResponse, ServerToolUse, Usage
+
+    base_response = ModelResponse(
+        model="deepseek-flash",
+        choices=[Choices(finish_reason="stop", index=0, message=Message(role="assistant", content="done"))],
+        usage=Usage(prompt_tokens=2912, completion_tokens=52, total_tokens=2964),
+    )
+    with_web_tools = ModelResponse(
+        model="deepseek-flash",
+        choices=[Choices(finish_reason="stop", index=0, message=Message(role="assistant", content="done"))],
+        usage=Usage(
+            prompt_tokens=2912,
+            completion_tokens=52,
+            total_tokens=2964,
+            server_tool_use=ServerToolUse(
+                web_search_requests=2,
+                tool_search=2,
+                web_fetch_requests=1,
+                tool_fetch=1,
+                tool_image_search=1,
+            ),
+        ),
+    )
+
+    base_cost = litellm.completion_cost(
+        completion_response=base_response,
+        model="deepseek/deepseek-flash",
+        custom_llm_provider="deepseek",
+    )
+    web_tools_cost = litellm.completion_cost(
+        completion_response=with_web_tools,
+        model="deepseek/deepseek-flash",
+        custom_llm_provider="deepseek",
+    )
+
+    assert base_cost > 0
+    assert web_tools_cost == base_cost
+
+
+@pytest.mark.parametrize(
+    ("optional_params", "expected_thinking", "expected_output_config"),
+    [
+        ({"output_config": {"effort": "low"}}, None, {"effort": "low"}),
+        (
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+            {"type": "adaptive"},
+            {"effort": "low"},
+        ),
+        (
+            {"thinking": {"type": "enabled"}, "output_config": {"effort": "high"}},
+            {"type": "enabled"},
+            {"effort": "high"},
+        ),
+        (
+            {"thinking": {"type": "disabled"}, "output_config": {"effort": "low"}},
+            {"type": "disabled"},
+            {"effort": "low"},
+        ),
+        ({"thinking": {"type": "adaptive"}}, {"type": "adaptive"}, None),
+    ],
+)
+def test_deepseek_anthropic_messages_preserves_native_thinking_and_effort(
+    optional_params,
+    expected_thinking,
+    expected_output_config,
+):
+    config = DeepSeekAnthropicMessagesConfig()
+
+    request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 4096,
+            "temperature": 0.2,
+            **optional_params,
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+
+    assert request.get("thinking") == expected_thinking
+    assert request.get("output_config") == expected_output_config
+    assert request["temperature"] == 0.2
+
+
+def test_deepseek_anthropic_messages_maps_reasoning_effort_without_budget_tokens():
+    config = DeepSeekAnthropicMessagesConfig()
+
+    low_request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 4096,
+            "reasoning_effort": "low",
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+    assert low_request["thinking"] == {"type": "enabled"}
+    assert low_request["output_config"] == {"effort": "low"}
+    assert "reasoning_effort" not in low_request
+
+    minimal_request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 4096,
+            "reasoning_effort": "minimal",
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+    assert minimal_request["thinking"] == {"type": "enabled"}
+    assert minimal_request["output_config"] == {"effort": "low"}
+    assert "reasoning_effort" not in minimal_request
+
+    none_request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 4096,
+            "reasoning_effort": "none",
+            "output_config": {"effort": "high", "format": {"type": "json_schema"}},
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+    assert none_request["thinking"] == {"type": "disabled"}
+    assert none_request["output_config"] == {"format": {"type": "json_schema"}}
+    assert "reasoning_effort" not in none_request
+
+    non_string_request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 4096,
+            "reasoning_effort": 123,
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+    assert "reasoning_effort" not in non_string_request
+    assert "thinking" not in non_string_request
+
+    explicit_override_request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 4096,
+            "reasoning_effort": "low",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+    assert explicit_override_request["thinking"] == {"type": "adaptive"}
+    assert explicit_override_request["output_config"] == {"effort": "max"}
+
+    disabled_thinking_request = config.transform_anthropic_messages_request(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        anthropic_messages_optional_request_params={
+            "max_tokens": 4096,
+            "reasoning_effort": "high",
+            "thinking": {"type": "disabled"},
+        },
+        litellm_params=GenericLiteLLMParams(),
+        headers={},
+    )
+    assert disabled_thinking_request["thinking"] == {"type": "disabled"}
+    assert "output_config" not in disabled_thinking_request
+
+    with pytest.raises(AnthropicError) as exc_info:
+        config.transform_anthropic_messages_request(
+            model="deepseek-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            anthropic_messages_optional_request_params={
+                "max_tokens": 4096,
+                "reasoning_effort": "bogus",
+            },
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+    assert exc_info.value.status_code == 400

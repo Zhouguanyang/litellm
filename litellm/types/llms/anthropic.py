@@ -602,6 +602,11 @@ class MessageDelta(TypedDict, total=False):
 
 class ServerToolUsage(TypedDict, total=False):
     web_search_requests: ReadOnly[int]
+    tool_search_requests: ReadOnly[int]
+    web_fetch_requests: ReadOnly[int]
+    tool_search: ReadOnly[int]
+    tool_fetch: ReadOnly[int]
+    tool_image_search: ReadOnly[int]
 
 
 class UsageDelta(TypedDict, total=False):

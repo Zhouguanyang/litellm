@@ -2181,6 +2181,103 @@ class TestAnthropicUsageOnlyFallback:
         assert usage.server_tool_use.web_search_requests == 1
         assert usage.server_tool_use.tool_search_requests == 3
 
+    def test_streaming_recovers_deepseek_server_tool_use_counters(self):
+        from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+        from litellm.llms.anthropic.messages.stream_assembly import build_complete_streaming_response
+
+        chunks = [
+            _sse_bytes(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_ds_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "deepseek-flash",
+                        "content": [],
+                        "usage": {"input_tokens": 2912, "output_tokens": 0},
+                    },
+                }
+            ),
+            _sse_bytes(
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_ds_00_1",
+                        "name": "deepseek_web_search",
+                        "input": {"action": "search", "queries": ["DeepSeek V4"]},
+                        "kind": "deep_search",
+                    },
+                }
+            ),
+            _sse_bytes({"type": "content_block_stop", "index": 0}),
+            _sse_bytes(
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                }
+            ),
+            _sse_bytes(
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": "Summary"},
+                }
+            ),
+            _sse_bytes({"type": "content_block_stop", "index": 1}),
+            _sse_bytes(
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {
+                        "output_tokens": 52,
+                        "server_tool_use": {
+                            "web_search_requests": 2,
+                            "tool_search": 1,
+                            "web_fetch_requests": 1,
+                            "tool_fetch": 1,
+                            "tool_image_search": 1,
+                        },
+                    },
+                }
+            ),
+            _sse_bytes({"type": "message_stop"}),
+        ]
+
+        usage_only = AnthropicPassthroughLoggingHandler._build_usage_only_response_from_chunks(
+            all_chunks=chunks, model="deepseek-flash"
+        )
+        assert usage_only is not None
+        assert usage_only.usage.server_tool_use.web_search_requests == 2
+        assert usage_only.usage.server_tool_use.tool_search == 1
+        assert usage_only.usage.server_tool_use.web_fetch_requests == 1
+        assert usage_only.usage.server_tool_use.tool_fetch == 1
+        assert usage_only.usage.server_tool_use.tool_image_search == 1
+
+        logging_obj = LiteLLMLoggingObj(
+            model="deepseek/deepseek-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            call_type="anthropic_messages",
+            start_time=0,
+            litellm_call_id="call_ds_1",
+            function_id="fn_ds_1",
+        )
+        complete = build_complete_streaming_response(
+            all_chunks=chunks,
+            litellm_logging_obj=logging_obj,
+            model="deepseek-flash",
+        )
+        assert complete is not None
+        assert complete.usage.server_tool_use.web_search_requests == 2
+        assert complete.usage.server_tool_use.tool_search == 1
+        assert complete.usage.server_tool_use.web_fetch_requests == 1
+        assert complete.usage.server_tool_use.tool_fetch == 1
+        assert complete.usage.server_tool_use.tool_image_search == 1
+
     @pytest.mark.parametrize(
         "event_str,expected",
         [

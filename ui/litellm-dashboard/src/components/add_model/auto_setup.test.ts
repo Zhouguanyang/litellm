@@ -325,6 +325,15 @@ describe("recommendSolverPair", () => {
     expect(selected?.notice).toContain("two model families");
   });
 
+  it("prefers the current DeepSeek Flash alias to versioned Flash deployments", () => {
+    const models = resolve(
+      deployment("current", "deepseek/deepseek-flash"),
+      deployment("versioned", "deepseek/deepseek-v9-flash"),
+      deployment("pro", "deepseek/deepseek-v9-pro"),
+    );
+    expect(names(recommendSolverPair(models, "balanced", "deepseek"))).toEqual(["current", "pro"]);
+  });
+
   it.each([
     ["glm", "zai/glm-7.3-flash", "zai/glm-7.3"],
     ["deepseek", "deepseek/deepseek-v9-flash", "deepseek/deepseek-v9-pro"],

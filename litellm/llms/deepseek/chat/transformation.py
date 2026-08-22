@@ -9,18 +9,25 @@ import litellm
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     convert_content_list_to_str,
+    drop_tool_reference_parts_from_tool_messages,
     extract_search_results_text,
 )
 from litellm.litellm_core_utils.reasoning_effort_utils import OPAQUE_VALUE, warn_dropped_reasoning
 from litellm.litellm_core_utils.tool_fields import tool_params_without_hosted_mcp
 from litellm.litellm_core_utils.url_utils import ensure_api_route
 from litellm.secret_managers.main import get_secret_str
-from litellm.types.llms.openai import AllMessageValues
+from litellm.types.llms.openai import (
+    AllMessageValues,
+    ChatCompletionFileObjectFile,
+    OpenAIMessageContentListBlock,
+)
+from litellm.types.utils import ProviderSpecificModelInfo
 from litellm.utils import supports_reasoning, supports_vision
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 
 SUPPORTED_REASONING_EFFORTS: Final = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+_DEEPSEEK_NATIVE_TOOL_TYPES: Final = frozenset({"deepseek_web_search", "deepseek_read_url"})
 _NO_BUDGET_REASON: Final = "DeepSeek takes thinking only as enabled or disabled, with no budget."
 
 
@@ -34,6 +41,12 @@ def _warn_on_dropped_budget(thinking: object, model: str) -> None:
 
 
 class DeepSeekChatConfig(OpenAIGPTConfig):
+    def get_provider_info(self, model: str) -> ProviderSpecificModelInfo | None:
+        if model.removeprefix("deepseek/") == "deepseek-flash":
+            provider_info: Final[ProviderSpecificModelInfo] = {"supports_vision": True}
+            return provider_info
+        return None
+
     def get_supported_openai_params(self, model: str) -> list[str]:
         """
         DeepSeek reasoner models support thinking parameter.
@@ -145,27 +158,23 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         self, messages: list[AllMessageValues], model: str, is_async: bool = False
     ) -> list[AllMessageValues] | Coroutine[object, object, list[AllMessageValues]]:
         """
-        DeepSeek vision models accept image_url content blocks in user
-        messages (https://api-docs.deepseek.com/guides/vision), so those
-        content lists are forwarded as-is, with any search_results text
-        appended as a trailing text block. Every other message keeps the
-        historical string collapse (which also folds search_results text
-        into string content); a list with no extractable text stays
-        unchanged, matching what DeepSeek historically received.
+        DeepSeek vision models accept image_url and file content blocks in
+        user and tool messages (https://api-docs.deepseek.com/guides/vision).
+        Every other message keeps the historical string collapse behavior.
         """
-        forward_images: Final = any(
+        forward_media: Final = any(
             isinstance(message.get("content"), list) for message in messages
         ) and supports_vision(model=model, custom_llm_provider="deepseek")
-        transformed: Final = [
-            self._forward_or_collapse_content(message=message, forward_images=forward_images) for message in messages
+        stripped: Final = drop_tool_reference_parts_from_tool_messages(messages)
+        transformed: Final = [  # mutable-ok: provider messages must stay JSON-array lists the base transform mutates
+            self._forward_or_collapse_content(message=message, forward_media=forward_media) for message in stripped
         ]
 
         if is_async:
-            return super()._transform_messages(messages=transformed, model=model, is_async=True)
-        else:
-            return super()._transform_messages(messages=transformed, model=model, is_async=False)
+            return self._async_transform_deepseek_messages(messages=transformed)
+        return self._transform_deepseek_messages(messages=transformed)
 
-    def _forward_or_collapse_content(self, message: AllMessageValues, forward_images: bool) -> AllMessageValues:
+    def _forward_or_collapse_content(self, message: AllMessageValues, forward_media: bool) -> AllMessageValues:
         """
         Returns the vision-forwardable message with any search_results text
         appended as a text block; every other message keeps the historical
@@ -173,12 +182,15 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         folds search_results text into string content.
         """
         content: Final = message.get("content")
-        if (
-            forward_images
-            and isinstance(content, list)
-            and self._is_vision_forwardable_content(message=message, content=content)
-        ):
-            return self._with_search_results_text_block(message=message, content=content)
+        if forward_media and isinstance(content, list) and content:
+            if self._is_vision_forwardable_content(message=message, content=content):
+                return self._with_search_results_text_block(message=message, content=content)
+            collapsed_content: Final = convert_content_list_to_str(message=message)
+            collapsed_message: Final = {  # mutable-ok: wire messages are plain JSON dicts
+                **message,
+                "content": collapsed_content,
+            }
+            return cast(AllMessageValues, collapsed_message)  # cast-ok: TypedDict spread narrows to dict
         collapsed: Final = convert_content_list_to_str(message=message)
         if not collapsed or collapsed == content:
             return message
@@ -187,28 +199,31 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
 
     def _is_vision_forwardable_content(self, message: AllMessageValues, content: Sequence[object]) -> bool:
         """
-        True only for a user message whose content list holds well-formed
-        text and image_url blocks with at least one image; a block missing
-        its payload falls back to the string collapse instead of crashing
-        or reaching the wire malformed. The model capability gate lives in
-        the caller.
+        True only for a user or tool message whose content list holds
+        well-formed text and image blocks with at least one image.
         """
-        if message.get("role") != "user":
+        if message.get("role") not in ("user", "tool"):
             return False
         if not all(self._is_forwardable_block(block) for block in content):
             return False
-        return any(isinstance(block, dict) and block.get("type") == "image_url" for block in content)
+        return any(
+            isinstance(block, Mapping) and cast(Mapping[str, object], block).get("type") in ("image_url", "file")
+            for block in content
+        )
 
     @staticmethod
     def _is_forwardable_block(block: object) -> bool:
-        """A dict block typed text or image_url that carries its payload."""
-        if not isinstance(block, dict):
+        """A supported content block that carries its required payload."""
+        if not isinstance(block, Mapping):
             return False
-        block_type: Final = block.get("type")
+        typed_block: Final = cast(Mapping[str, object], block)  # cast-ok: content block keys are strings
+        block_type: Final = typed_block.get("type")
         if block_type == "image_url":
-            return DeepSeekChatConfig._is_image_url_payload(block.get("image_url"))
+            return DeepSeekChatConfig._is_image_url_payload(typed_block.get("image_url"))
+        if block_type == "file":
+            return DeepSeekChatConfig._is_file_payload(typed_block)
         if block_type == "text":
-            return isinstance(block.get("text"), str)
+            return isinstance(typed_block.get("text"), str)
         return False
 
     @staticmethod
@@ -218,8 +233,89 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
             return bool(payload)
         if not isinstance(payload, Mapping):
             return False
-        url: Final = payload.get("url")
+        typed_payload: Final = cast(Mapping[str, object], payload)  # cast-ok: image payload keys are strings
+        url: Final = typed_payload.get("url")
         return isinstance(url, str) and bool(url)
+
+    @staticmethod
+    def _file_payload(block: Mapping[str, object]) -> Mapping[str, object]:
+        nested: Final = block.get("file")
+        if not isinstance(nested, Mapping):
+            return block
+        return cast(Mapping[str, object], nested)  # cast-ok: file payload keys are strings
+
+    @staticmethod
+    def _is_file_payload(block: Mapping[str, object]) -> bool:
+        payload: Final = DeepSeekChatConfig._file_payload(block)
+        file_data: Final = payload.get("file_data")
+        file_id: Final = payload.get("file_id")
+        filename: Final = payload.get("filename")
+        has_file_data: Final = isinstance(file_data, str) and bool(file_data)
+        has_file_id: Final = isinstance(file_id, str) and bool(file_id)
+        valid_filename: Final = filename is None or (has_file_data and isinstance(filename, str))
+        return has_file_data != has_file_id and valid_filename
+
+    @staticmethod
+    def _flatten_file_block(block: Mapping[str, object]) -> dict[str, object]:
+        payload: Final = DeepSeekChatConfig._file_payload(block)
+        fields: Final = {key: payload[key] for key in ("file_data", "file_id", "filename") if key in payload}
+        return {"type": "file", **fields}
+
+    def _transform_deepseek_content_item(self, block: object) -> object:
+        if not isinstance(block, Mapping):
+            return block
+        typed_block: Final = cast(Mapping[str, object], block)  # cast-ok: content block keys are strings
+        copied: Final = cast(OpenAIMessageContentListBlock, dict(typed_block))
+        if typed_block.get("type") == "file":
+            nested: Final = typed_block.get("file")
+            if isinstance(nested, Mapping):
+                if not self.contains_pdf_url(cast(ChatCompletionFileObjectFile, nested)):
+                    return self._flatten_file_block(typed_block)
+                transformed: Final = self._transform_content_item(copied)
+                return self._flatten_file_block(cast(Mapping[str, object], transformed))
+            return self._flatten_file_block(typed_block)
+        return self._transform_content_item(copied)
+
+    async def _async_transform_deepseek_content_item(self, block: object) -> object:
+        if not isinstance(block, Mapping):
+            return block
+        typed_block: Final = cast(Mapping[str, object], block)  # cast-ok: content block keys are strings
+        copied: Final = cast(OpenAIMessageContentListBlock, dict(typed_block))
+        if typed_block.get("type") == "file":
+            nested: Final = typed_block.get("file")
+            if isinstance(nested, Mapping):
+                if not self.contains_pdf_url(cast(ChatCompletionFileObjectFile, nested)):
+                    return self._flatten_file_block(typed_block)
+                transformed: Final = await self._async_transform_content_item(copied)
+                return self._flatten_file_block(cast(Mapping[str, object], transformed))
+            return self._flatten_file_block(typed_block)
+        return await self._async_transform_content_item(copied)
+
+    def _transform_deepseek_message(self, message: AllMessageValues) -> AllMessageValues:
+        message_fields: Final = cast(Mapping[str, object], message)  # cast-ok: message keys are strings
+        content: Final = message_fields.get("content")
+        if message_fields.get("role") not in ("user", "tool") or not isinstance(content, list):
+            return message
+        content_blocks: Final = cast(Sequence[object], content)  # cast-ok: list elements are validated below
+        transformed_content: Final = [self._transform_deepseek_content_item(block) for block in content_blocks]
+        return cast(AllMessageValues, {**message_fields, "content": transformed_content})
+
+    async def _async_transform_deepseek_message(self, message: AllMessageValues) -> AllMessageValues:
+        message_fields: Final = cast(Mapping[str, object], message)  # cast-ok: message keys are strings
+        content: Final = message_fields.get("content")
+        if message_fields.get("role") not in ("user", "tool") or not isinstance(content, list):
+            return message
+        content_blocks: Final = cast(Sequence[object], content)  # cast-ok: list elements are validated below
+        transformed_content: Final = [
+            await self._async_transform_deepseek_content_item(block) for block in content_blocks
+        ]
+        return cast(AllMessageValues, {**message_fields, "content": transformed_content})
+
+    def _transform_deepseek_messages(self, messages: list[AllMessageValues]) -> list[AllMessageValues]:
+        return [self._transform_deepseek_message(message) for message in messages]
+
+    async def _async_transform_deepseek_messages(self, messages: list[AllMessageValues]) -> list[AllMessageValues]:
+        return [await self._async_transform_deepseek_message(message) for message in messages]
 
     def _with_search_results_text_block(self, message: AllMessageValues, content: Sequence[object]) -> AllMessageValues:
         """
@@ -254,12 +350,13 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
     @staticmethod
     def _drop_unsupported_tools(optional_params: dict) -> dict:
         """
-        DeepSeek's /chat/completions only accepts tools of type "function".
+        DeepSeek's /chat/completions accepts function tools and DeepSeek's native
+        server-side web tools (`deepseek_web_search`, `deepseek_read_url`).
 
         Requests bridged from /v1/responses can carry responses-API-native tool
         types (e.g. a Codex CLI tool typed "namespace"); DeepSeek rejects the
         whole request with `unknown variant '<type>', expected 'function'` (issue
-        #30722). Drop the unsupported entries so the function tools still go
+        #30722). Drop the unsupported entries so the supported tools still go
         through, and drop the now-dangling tool_choice/parallel_tool_calls when
         nothing callable survives.
 
@@ -271,19 +368,24 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
             return optional_params
         sent_tools: Final[tuple[object, ...]] = tuple(tools)
 
-        def _is_function_tool(tool: object) -> bool:
-            return isinstance(tool, dict) and tool.get("type") == "function"
+        def _is_supported_tool(tool: object) -> bool:
+            fields: Final = as_str_mapping(tool)
+            if fields is None:
+                return False
+            tool_type: Final = fields.get("type")
+            return tool_type == "function" or tool_type in _DEEPSEEK_NATIVE_TOOL_TYPES
 
         def _get_function_tool_name(tool: object) -> str | None:
-            if not isinstance(tool, dict):
+            fields: Final = as_str_mapping(tool)
+            if fields is None or fields.get("type") != "function":
                 return None
-            function: Final = tool.get("function")
-            if not isinstance(function, dict):
+            function: Final = as_str_mapping(fields.get("function"))
+            if function is None:
                 return None
             name: Final = function.get("name")
             return name if isinstance(name, str) else None
 
-        def _tool_choice_matches_function_tool(tool_choice: object, function_tool_names: set[str]) -> bool:
+        def _tool_choice_matches_function_tool(tool_choice: object, function_tool_names: frozenset[str]) -> bool:
             if not isinstance(tool_choice, dict):
                 return True
             if tool_choice.get("type") != "function":
@@ -294,31 +396,31 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
             name: Final = function.get("name")
             return isinstance(name, str) and name in function_tool_names
 
-        function_tools: Final = [tool for tool in sent_tools if _is_function_tool(tool)]
-        if len(function_tools) == len(sent_tools):
+        supported_tools: Final = [tool for tool in sent_tools if _is_supported_tool(tool)]
+        if len(supported_tools) == len(sent_tools):
             return optional_params
 
         dropped_types: Final = sorted(
             {
                 str(tool.get("type")) if isinstance(tool, dict) else type(tool).__name__
                 for tool in sent_tools
-                if not _is_function_tool(tool)
+                if not _is_supported_tool(tool)
             }
         )
         litellm.verbose_logger.warning(
-            "DeepSeek chat completions only supports function tools; dropping "
-            "unsupported tool type(s) %s before sending the request",
+            "DeepSeek chat completions does not support tool type(s) %s; dropping "
+            "unsupported tool(s) before sending the request",
             dropped_types,
         )
 
         cleaned = {k: v for k, v in optional_params.items() if k != "tools"}
-        if function_tools:
-            function_tool_names: Final = {
-                name for tool in function_tools for name in (_get_function_tool_name(tool),) if name is not None
-            }
+        if supported_tools:
+            function_tool_names: Final = frozenset(
+                name for name in map(_get_function_tool_name, supported_tools) if name is not None
+            )
             if not _tool_choice_matches_function_tool(cleaned.get("tool_choice"), function_tool_names):
                 cleaned = {k: v for k, v in cleaned.items() if k != "tool_choice"}
-            return {**cleaned, "tools": function_tools}
+            return {**cleaned, "tools": supported_tools}
         return {k: v for k, v in cleaned.items() if k not in ("tool_choice", "parallel_tool_calls")}
 
     def transform_request(
@@ -364,9 +466,10 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         optional_params = self._drop_unsupported_tools(optional_params)
         if self._thinking_mode_active(model=model, optional_params=optional_params):
             messages = self._fill_reasoning_content(messages)
-        return await super().async_transform_request(
+        transformed_messages: Final = await self._transform_messages(messages=messages, model=model, is_async=True)
+        return super().transform_request(
             model=model,
-            messages=messages,
+            messages=transformed_messages,
             optional_params=optional_params,
             litellm_params=litellm_params,
             headers=headers,
@@ -375,7 +478,7 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
     def _get_openai_compatible_provider_info(
         self, api_base: str | None, api_key: str | None
     ) -> tuple[str | None, str | None]:
-        api_base = api_base or get_secret_str("DEEPSEEK_API_BASE") or "https://api.deepseek.com/beta"
+        api_base = api_base or get_secret_str("DEEPSEEK_API_BASE") or "https://api.deepseek.com"
         dynamic_api_key: Final = api_key or get_secret_str("DEEPSEEK_API_KEY")
         return api_base, dynamic_api_key
 
@@ -391,4 +494,4 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         """
         If api_base is not provided, use the default DeepSeek /chat/completions endpoint.
         """
-        return ensure_api_route(api_base or "https://api.deepseek.com/beta", "chat/completions")
+        return ensure_api_route(api_base or "https://api.deepseek.com", "chat/completions")

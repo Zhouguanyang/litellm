@@ -2013,6 +2013,10 @@ class ServerToolUse(LiteLLMBaseModel):
     web_search_requests: int | None = None
     tool_search_requests: int | None = None
     browser_open_requests: int | None = None
+    web_fetch_requests: int | None = None
+    tool_search: int | None = None
+    tool_fetch: int | None = None
+    tool_image_search: int | None = None
 
     def __getitem__(self, key: str) -> int | None:
         if key not in self.__class__.model_fields:
