@@ -42,8 +42,24 @@ def test_deepseek_mock_completion(stream):
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("messages", "expected_url"),
+    [
+        (
+            [{"role": "user", "content": "Hello, world!"}],
+            "https://api.deepseek.com/chat/completions",
+        ),
+        (
+            [
+                {"role": "user", "content": "Write quick sort code"},
+                {"role": "assistant", "content": "```python\n", "prefix": True},
+            ],
+            "https://api.deepseek.com/beta/chat/completions",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_deepseek_provider_async_completion(stream):
+async def test_deepseek_provider_async_completion(stream, messages, expected_url):
     """
     Test that Deepseek provider requests are formatted correctly with the proper parameters
     """
@@ -57,7 +73,6 @@ async def test_deepseek_provider_async_completion(stream):
     # Set up the test parameters
     api_key = "fake_api_key"
     model = "deepseek/deepseek-reasoner"
-    messages = [{"role": "user", "content": "Hello, world!"}]
 
     # Mock AsyncHTTPHandler.post method for async test
     with patch(
@@ -99,7 +114,7 @@ async def test_deepseek_provider_async_completion(stream):
 
     # Check request body
     request_body = json.loads(call_args.kwargs["data"])
-    assert call_args.kwargs["url"] == "https://api.deepseek.com/beta/chat/completions"
+    assert call_args.kwargs["url"] == expected_url
     assert (
         request_body["model"] == "deepseek-reasoner"
     )  # Model name should be stripped of provider prefix
