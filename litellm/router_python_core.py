@@ -619,6 +619,10 @@ _ALIAS_PARAMS_NEVER_FORWARDED: Final = frozenset(
     {"model", "api_base", "api_key", "api_version", "responses_api_version"}
 )
 _ALIAS_MARKER_FORWARDED_PARAMS_KWARG: Final = "_alias_marker_forwarded_params"
+_PRE_ROUTING_LITELLM_PARAM_KEYS_KWARG: Final = "_pre_routing_litellm_param_keys"
+_PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT: Final[ContextVar[tuple[int, tuple[str, ...]] | None]] = ContextVar(
+    "pre_routing_litellm_param_keys", default=None
+)
 _FORWARDED_CREDENTIAL_ISOLATION_PROVIDERS: Final = frozenset({"chatgpt", "anthropic"})
 _CLAUDE_CODE_SESSION_ID_RE: Final = re.compile(r"^[a-zA-Z0-9_\-]{8,}$")
 _CLAUDE_CODE_SESSION_ROUTER_TTL_SECONDS: Final = 3600
@@ -5266,6 +5270,20 @@ class PythonCore(DeprecatedRouterMembers):
         if "tool_choice" not in kwargs and dep_params.get("tool_choice") is not None:
             kwargs["tool_choice"] = dep_params["tool_choice"]
 
+    @staticmethod
+    def _enforce_deployment_service_tier(
+        deployment: Mapping[str, object],
+        kwargs: MutableMapping[str, object],
+        higher_precedence_param_keys: Sequence[str] = (),
+    ) -> None:
+        raw_params: Final = deployment["litellm_params"]
+        deployment_litellm_params: Final = _LITELLM_PARAMS_ADAPTER.validate_python(
+            raw_params.model_dump(exclude_none=True) if isinstance(raw_params, LiteLLM_Params) else raw_params
+        )
+        deployment_service_tier: Final = deployment_litellm_params.get("service_tier")
+        if deployment_service_tier is not None and "service_tier" not in higher_precedence_param_keys:
+            kwargs["service_tier"] = deployment_service_tier  # rebind-ok: fill request-owned kwargs
+
     def _update_kwargs_with_deployment(
         self,
         deployment: dict,
@@ -5282,6 +5300,12 @@ class PythonCore(DeprecatedRouterMembers):
         - On a fallback hop, drops the encrypted reasoning this deployment cannot decrypt, keeping its summary.
         - On a Responses continuation, sends the partial response as prefill where this deployment takes one.
         """
+        kwargs.pop(_PRE_ROUTING_LITELLM_PARAM_KEYS_KWARG, None)
+        pre_routing_context: Final = _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.get()
+        _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set(None)
+        pre_routing_litellm_param_keys: Final = (
+            pre_routing_context[1] if pre_routing_context is not None and pre_routing_context[0] == id(kwargs) else ()
+        )
         for key in self._forwarded_alias_marker_keys_the_deployment_sets(
             deployment=deployment, forwarded_keys=kwargs.pop(_ALIAS_MARKER_FORWARDED_PARAMS_KWARG, ())
         ):
@@ -5289,6 +5313,9 @@ class PythonCore(DeprecatedRouterMembers):
         kwargs.pop("daily_reset_time", None)  # pyright: ignore[reportUnknownMemberType]  # kwargs is an untyped dict
         defaults: Final = _LITELLM_PARAMS_ADAPTER.validate_python(self._core_default_litellm_params)
         self._merge_tools_from_deployment(deployment=deployment, kwargs=kwargs, defaults=defaults)
+        self._enforce_deployment_service_tier(
+            deployment=deployment, kwargs=kwargs, higher_precedence_param_keys=pre_routing_litellm_param_keys
+        )
 
         model_info = deployment.get("model_info", {}).copy()
         deployment_litellm_model_name = deployment["litellm_params"]["model"]
@@ -6005,6 +6032,7 @@ class PythonCore(DeprecatedRouterMembers):
         filtered_data: Final = {k: v for k, v in data.items() if k not in prompt_management_params}
 
         kwargs = {**filtered_data, **kwargs, **optional_params}
+        self._enforce_deployment_service_tier(deployment=prompt_management_deployment, kwargs=kwargs)
         kwargs["model"] = model
         kwargs["messages"] = messages
         kwargs["litellm_logging_obj"] = litellm_logging_object
@@ -6444,6 +6472,7 @@ class PythonCore(DeprecatedRouterMembers):
                 elif k == "metadata":
                     kwargs[k].update(v)
             pinned_model_id: Final = deployment_model_id_pin(_LITELLM_PARAMS_ADAPTER.validate_python(data))
+            self._enforce_deployment_service_tier(deployment=deployment, kwargs=kwargs)
             if pinned_model_id is not None:
                 kwargs["model_id"] = pinned_model_id  # rebind-ok: this call's own kwargs, filled like the defaults
 
@@ -15930,6 +15959,8 @@ class PythonCore(DeprecatedRouterMembers):
         )
         self._drop_client_carriers_a_tier_pin_supersedes(request_kwargs, surface_tier_params)
         request_kwargs.update(surface_tier_params)
+        if surface_tier_params:
+            _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set((id(request_kwargs), tuple(surface_tier_params)))
         return not OUTPUT_TOKEN_CEILING_PARAMS.isdisjoint(surface_tier_params)
 
     @staticmethod
@@ -16008,6 +16039,7 @@ class PythonCore(DeprecatedRouterMembers):
         input: str | list | None,
         specific_deployment: bool | None,
     ):
+        _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set(None)
         if (
             self._core_routing_strategy != "usage-based-routing-v2"
             and self._core_routing_strategy != "simple-shuffle"
@@ -16953,6 +16985,7 @@ class PythonCore(DeprecatedRouterMembers):
         """
         Returns the deployment based on routing strategy
         """
+        _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set(None)
         if self._core_routing_plugins:
             raise ValueError(
                 "Router(plugins=[...]) is configured, but this call resolved to the synchronous "
