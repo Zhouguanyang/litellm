@@ -9,6 +9,16 @@ from litellm.constants import (
 OpenAIStyleReasoningEffort = Literal["minimal", "low", "medium", "high"]
 
 
+def normalize_reasoning_effort_for_chat_completion(value: object) -> str | None:
+    match value:
+        case str(effort):
+            return effort
+        case {"effort": str(effort)}:
+            return effort
+        case _:
+            return None
+
+
 def reasoning_effort_from_thinking_budget(
     budget_tokens: int,
 ) -> OpenAIStyleReasoningEffort:
