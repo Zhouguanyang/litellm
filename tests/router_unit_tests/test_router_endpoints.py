@@ -432,6 +432,62 @@ async def test_aaaaatext_completion_endpoint(model_list, sync_mode):
     assert response.choices[0].text == "I'm fine, thank you!"
 
 
+@pytest.mark.parametrize("configured_service_tier", ["default", "flex", "priority"])
+def test_text_completion_enforces_configured_service_tier(model_list, configured_service_tier):
+    model_list[0]["litellm_params"]["service_tier"] = configured_service_tier
+    router = Router(model_list=model_list)
+
+    with patch("litellm.text_completion") as mock_text_completion:
+        router.text_completion(
+            model="gpt-5-mini",
+            prompt="Hello",
+            service_tier="auto",
+        )
+
+    assert mock_text_completion.call_args.kwargs["service_tier"] == configured_service_tier
+
+
+def test_completion_rejects_caller_supplied_pre_routing_service_tier_marker(model_list):
+    model_list[0]["litellm_params"]["service_tier"] = "default"
+    router = Router(model_list=model_list)
+    mock_completion = MagicMock(
+        return_value=litellm.ModelResponse(choices=[{"message": {"content": "hi"}}])
+    )
+
+    with patch.object(litellm, "completion", mock_completion):
+        router.completion(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": "Hello"}],
+            service_tier="flex",
+            _pre_routing_litellm_param_keys=["service_tier"],
+        )
+
+    sent = mock_completion.call_args.kwargs
+    assert sent["service_tier"] == "default"
+    assert "_pre_routing_litellm_param_keys" not in sent
+
+
+@pytest.mark.asyncio
+async def test_acompletion_rejects_caller_supplied_pre_routing_service_tier_marker(model_list):
+    model_list[0]["litellm_params"]["service_tier"] = "default"
+    router = Router(model_list=model_list)
+    mock_acompletion = AsyncMock(
+        return_value=litellm.ModelResponse(choices=[{"message": {"content": "hi"}}])
+    )
+
+    with patch.object(litellm, "acompletion", mock_acompletion):
+        await router.acompletion(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": "Hello"}],
+            service_tier="flex",
+            _pre_routing_litellm_param_keys=["service_tier"],
+        )
+
+    sent = mock_acompletion.call_args.kwargs
+    assert sent["service_tier"] == "default"
+    assert "_pre_routing_litellm_param_keys" not in sent
+
+
 @pytest.mark.asyncio
 async def test_router_with_empty_choices(model_list):
     """
