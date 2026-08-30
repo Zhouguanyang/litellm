@@ -1512,10 +1512,9 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 # Accept both string ("low") and dict ({"effort": "low",
                 # "summary": "concise"}). The Responses->Chat parser keeps the
                 # full dict when `summary` is set (see #25359), so a dict here
-                # is the standard shape Otto/OpenAI-Responses-Bridge callers
-                # send. Coerce to the effort string before mapping — same
-                # shape-tolerance the GPT-5 path already implements in
-                # `_normalize_reasoning_effort_for_chat_completion`.
+                # is the standard shape OpenAI Responses bridge callers send.
+                # Coerce to the effort string before mapping, matching
+                # the shared chat-completion normalization.
                 effort_value = value
                 if isinstance(effort_value, dict):
                     effort_value = effort_value.get("effort")

@@ -13,6 +13,9 @@ from typing import Any, Final, cast
 import httpx
 
 import litellm
+from litellm.litellm_core_utils.reasoning_effort_utils import (
+    normalize_reasoning_effort_for_chat_completion,
+)
 from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
@@ -56,17 +59,29 @@ class OpenrouterConfig(OpenAIGPTConfig):
         model: str,
         drop_params: bool,
     ) -> dict:
-        # OpenRouter expects "xhigh" instead of "max" for reasoning_effort.
-        if non_default_params.get("reasoning_effort") == "max":
-            non_default_params = {**non_default_params, "reasoning_effort": "xhigh"}
+        raw_reasoning_effort: Final = non_default_params.get("reasoning_effort")
+        normalized_reasoning_effort: Final = normalize_reasoning_effort_for_chat_completion(raw_reasoning_effort)
+        openrouter_reasoning_effort: Final = (
+            "xhigh" if normalized_reasoning_effort == "max" else normalized_reasoning_effort
+        )
+        normalized_non_default_params: Final = (
+            {
+                **non_default_params,
+                "reasoning_effort": openrouter_reasoning_effort,
+            }
+            if openrouter_reasoning_effort is not None
+            else {key: value for key, value in non_default_params.items() if key != "reasoning_effort"}
+        )
 
-        mapped_openai_params: Final = super().map_openai_params(non_default_params, optional_params, model, drop_params)
+        mapped_openai_params: Final = super().map_openai_params(
+            normalized_non_default_params, optional_params, model, drop_params
+        )
 
         # OpenRouter-only parameters
         extra_body: Final = {}
-        transforms: Final = non_default_params.pop("transforms", None)
-        models: Final = non_default_params.pop("models", None)
-        route: Final = non_default_params.pop("route", None)
+        transforms: Final = normalized_non_default_params.pop("transforms", None)
+        models: Final = normalized_non_default_params.pop("models", None)
+        route: Final = normalized_non_default_params.pop("route", None)
         if transforms is not None:
             extra_body["transforms"] = transforms
         if models is not None:
