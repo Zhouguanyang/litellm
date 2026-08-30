@@ -6,6 +6,9 @@ from typing import ClassVar, Final
 
 import litellm
 from litellm._logging import verbose_logger
+from litellm.litellm_core_utils.reasoning_effort_utils import (
+    normalize_reasoning_effort_for_chat_completion,
+)
 from litellm.utils import (
     declared_value_factory,
     has_catalog_entry,
@@ -53,23 +56,6 @@ def _catalogue_declares_default_effort() -> bool:
     return any(
         isinstance(entry, dict) and "default_reasoning_effort" in entry for entry in (*litellm.model_cost.values(),)
     )
-
-
-def _normalize_reasoning_effort_for_chat_completion(
-    value: str | dict | None,
-) -> str | None:
-    """Convert reasoning_effort to the string format expected by OpenAI chat completion API.
-
-    The chat completion API expects an effort string such as 'low' or 'high'.
-    Config/deployments may pass the Responses API format: {'effort': 'high', 'summary': 'detailed'}.
-    """
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict) and "effort" in value:
-        return value["effort"]
-    return None
 
 
 def get_effort_level(value: str | dict | None) -> str | None:
@@ -351,7 +337,7 @@ class OpenAIGPT5Config(OpenAIGPTConfig):
         # Normalize dict reasoning_effort to string for Chat Completions API.
         # Example: {"effort": "high", "summary": "detailed"} -> "high"
         if isinstance(raw_reasoning_effort, dict) and "effort" in raw_reasoning_effort:
-            normalized: Final = _normalize_reasoning_effort_for_chat_completion(raw_reasoning_effort)
+            normalized: Final = normalize_reasoning_effort_for_chat_completion(raw_reasoning_effort)
             if normalized is not None:
                 if "reasoning_effort" in non_default_params:
                     non_default_params["reasoning_effort"] = normalized
