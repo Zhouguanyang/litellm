@@ -1,15 +1,228 @@
 import asyncio
 import json
 import os
-from typing import Final
+from collections.abc import AsyncIterable
+from typing import Final, Literal, TypeAlias, assert_never
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
-import litellm
 import pytest
 import respx
+from pydantic import JsonValue, TypeAdapter
+
+import litellm
 from litellm import Router
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+_TIER_REQUEST: Final = TypeAdapter(dict[str, JsonValue])
+_TierSurface: TypeAlias = Literal["chat", "responses", "messages", "native"]
+
+
+class _GeminiTierPeer:
+    def __init__(self) -> None:
+        self.requests: tuple[httpx.Request, ...] = ()
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests = (*self.requests, request)
+        if request.url.path.startswith("/primary/"):
+            return httpx.Response(503, json={"error": {"code": 503, "message": "primary unavailable"}})
+        body: Final = {
+            "responseId": "gemini-tier-response",
+            "modelVersion": "gemini-4-carbon",
+            "candidates": [
+                {
+                    "content": {"role": "model", "parts": [{"text": "tier reply"}]},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 2, "totalTokenCount": 4},
+        }
+        if ":streamGenerateContent" in request.url.path:
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=f"data: {json.dumps(body)}\n\n"
+            )
+        return httpx.Response(200, json=body)
+
+
+async def _gemini_tier_call(
+    router: Router, surface: _TierSurface, stream: bool, extra_body: dict[str, object] | None = None
+) -> object:
+    body_params: Final = {"extra_body": extra_body} if extra_body is not None else {}
+    match surface:
+        case "chat":
+            return await router.acompletion(
+                model="tier-model",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=stream,
+                service_tier="priority",
+                **body_params,
+            )
+        case "responses":
+            return await router.aresponses(
+                model="tier-model", input="hello", stream=stream, service_tier="priority", **body_params
+            )
+        case "messages":
+            return await router.anthropic_messages(
+                model="tier-model",
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=16,
+                stream=stream,
+                service_tier="priority",
+                **body_params,
+            )
+        case "native":
+            call: Final = router.agenerate_content_stream if stream else router.agenerate_content
+            return await call(
+                model="tier-model",
+                contents=[{"role": "user", "parts": [{"text": "hello"}]}],
+                service_tier="priority",
+                serviceTier="priority",
+                config={"service_tier": "priority"},
+                **body_params,
+            )
+        case _:
+            assert_never(surface)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("chat", "responses", "messages", "native"))
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize(
+    "configured,expected",
+    (("flex", "flex"), ("priority", "priority"), ("default", "standard"), ("auto", "priority"), (None, "priority")),
+)
+async def test_deployment_service_tier_reaches_gemini_on_every_surface(
+    surface: _TierSurface, stream: bool, configured: str | None, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "tier-model",
+                "litellm_params": {
+                    "model": "gemini/gemini-4-carbon",
+                    "api_key": "synthetic-tier-key",
+                    "api_base": "https://gemini-tier.test",
+                    "service_tier": configured,
+                },
+            }
+        ],
+        num_retries=0,
+    )
+    peer: Final = _GeminiTierPeer()
+    with respx.mock() as upstream:
+        upstream.post(url__regex=r"https://gemini-tier\.test/.*").mock(side_effect=peer)
+        response: Final = await _gemini_tier_call(router, surface, stream)
+        if stream:
+            assert isinstance(response, AsyncIterable)
+            chunks: Final = tuple([chunk async for chunk in response])
+            assert chunks
+        else:
+            assert response is not None
+        assert len(peer.requests) == 1
+        body: Final = _TIER_REQUEST.validate_json(peer.requests[0].content)
+        assert body.get("serviceTier") == expected, body
+        assert "service_tier" not in body
+        generation: Final = body.get("generationConfig", {})
+        assert isinstance(generation, dict)
+        assert "serviceTier" not in generation and "service_tier" not in generation
+    router.retire()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("chat", "responses", "messages", "native"))
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("body_source", ("request", "deployment", "defaults"))
+@pytest.mark.parametrize("configured,expected", (("flex", "flex"), (None, "priority")))
+async def test_deployment_service_tier_overrides_conflicting_extra_body(
+    surface: _TierSurface,
+    stream: bool,
+    body_source: str,
+    configured: str | None,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    extra_body: Final = {
+        "serviceTier": "priority",
+        "labels": {"proof": "kept"},
+        **({"service_tier": "priority"} if configured is not None else {}),
+    }
+    original_body: Final = dict(extra_body)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "tier-model",
+                "litellm_params": {
+                    "model": "gemini/gemini-4-carbon",
+                    "api_key": "synthetic-tier-key",
+                    "api_base": "https://gemini-tier.test",
+                    "service_tier": configured,
+                    **({"extra_body": extra_body} if body_source == "deployment" else {}),
+                },
+            }
+        ],
+        default_litellm_params={"extra_body": extra_body} if body_source == "defaults" else {},
+        num_retries=0,
+    )
+    peer: Final = _GeminiTierPeer()
+    with respx.mock() as upstream:
+        upstream.post(url__regex=r"https://gemini-tier\.test/.*").mock(side_effect=peer)
+        response: Final = await _gemini_tier_call(
+            router, surface, stream, extra_body if body_source == "request" else None
+        )
+        if stream:
+            assert isinstance(response, AsyncIterable)
+            assert tuple([chunk async for chunk in response])
+        else:
+            assert response is not None
+        body: Final = _TIER_REQUEST.validate_json(peer.requests[0].content)
+        assert (body.get("serviceTier"), body.get("service_tier"), body.get("labels")) == (
+            expected, None, {"proof": "kept"}
+        ), body
+        assert extra_body == original_body
+    router.retire()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("chat", "responses", "messages", "native"))
+@pytest.mark.parametrize("stream", (False, True))
+async def test_gemini_fallback_uses_its_own_deployment_service_tier(
+    surface: _TierSurface, stream: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": name,
+                "litellm_params": {
+                    "model": "gemini/gemini-4-carbon",
+                    "api_key": "synthetic-tier-key",
+                    "api_base": f"https://gemini-tier.test/{path}",
+                    "service_tier": tier,
+                },
+            }
+            for name, path, tier in (("tier-model", "primary", "flex"), ("tier-backup", "backup", "priority"))
+        ],
+        fallbacks=[{"tier-model": ["tier-backup"]}],
+        num_retries=0,
+        disable_cooldowns=True,
+    )
+    peer: Final = _GeminiTierPeer()
+    with respx.mock() as upstream:
+        upstream.post(url__regex=r"https://gemini-tier\.test/.*").mock(side_effect=peer)
+        response: Final = await _gemini_tier_call(router, surface, stream, {"serviceTier": "priority"})
+        if stream:
+            assert isinstance(response, AsyncIterable)
+            assert tuple([chunk async for chunk in response])
+        else:
+            assert response is not None
+        assert tuple(_TIER_REQUEST.validate_json(request.content).get("serviceTier") for request in peer.requests) == (
+            "flex",
+            "priority",
+        )
+    router.retire()
 
 
 @pytest.fixture
@@ -215,6 +428,62 @@ async def test_aaaaatext_completion_endpoint(model_list, sync_mode):
         )
 
     assert response.choices[0].text == "I'm fine, thank you!"
+
+
+@pytest.mark.parametrize("configured_service_tier", ["default", "flex", "priority"])
+def test_text_completion_enforces_configured_service_tier(model_list, configured_service_tier):
+    model_list[0]["litellm_params"]["service_tier"] = configured_service_tier
+    router = Router(model_list=model_list)
+
+    with patch("litellm.text_completion") as mock_text_completion:
+        router.text_completion(
+            model="gpt-5-mini",
+            prompt="Hello",
+            service_tier="auto",
+        )
+
+    assert mock_text_completion.call_args.kwargs["service_tier"] == configured_service_tier
+
+
+def test_completion_rejects_caller_supplied_pre_routing_service_tier_marker(model_list):
+    model_list[0]["litellm_params"]["service_tier"] = "default"
+    router = Router(model_list=model_list)
+    mock_completion = MagicMock(
+        return_value=litellm.ModelResponse(choices=[{"message": {"content": "hi"}}])
+    )
+
+    with patch.object(litellm, "completion", mock_completion):
+        router.completion(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": "Hello"}],
+            service_tier="flex",
+            _pre_routing_litellm_param_keys=["service_tier"],
+        )
+
+    sent = mock_completion.call_args.kwargs
+    assert sent["service_tier"] == "default"
+    assert "_pre_routing_litellm_param_keys" not in sent
+
+
+@pytest.mark.asyncio
+async def test_acompletion_rejects_caller_supplied_pre_routing_service_tier_marker(model_list):
+    model_list[0]["litellm_params"]["service_tier"] = "default"
+    router = Router(model_list=model_list)
+    mock_acompletion = AsyncMock(
+        return_value=litellm.ModelResponse(choices=[{"message": {"content": "hi"}}])
+    )
+
+    with patch.object(litellm, "acompletion", mock_acompletion):
+        await router.acompletion(
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": "Hello"}],
+            service_tier="flex",
+            _pre_routing_litellm_param_keys=["service_tier"],
+        )
+
+    sent = mock_acompletion.call_args.kwargs
+    assert sent["service_tier"] == "default"
+    assert "_pre_routing_litellm_param_keys" not in sent
 
 
 @pytest.mark.asyncio

@@ -38,8 +38,10 @@ from litellm.router_rust.invoke.shaping import (
     STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
     Shaping,
     as_dict,
+    carry_pre_routing_service_tier,
     deployment_params_with_request_reasoning_override,
     drop_unsupported_classifier_reasoning_effort,
+    enforce_deployment_service_tier,
     metadata_bucket,
     stamp_deployment_num_retries,
     stamp_failed_deployment_id,
@@ -893,6 +895,7 @@ def attempt_call(
     helper receives it), shaped for the deployment and merged with its litellm params."""
     shaping: Final = core.shaping
     kwargs: Final = without(request, *ROUTING_KEYS)
+    carry_pre_routing_service_tier(request, kwargs)
     named: Final = {name: kwargs.pop(name) for name in plan.named if name in kwargs}
     data: Final = _deployment_params(plan, deployment)
     model_name: Final = str(data.get("model"))
@@ -2203,6 +2206,7 @@ class RustEndpoints:
                 metadata_bucket(kwargs, key).update(
                     metadata_defaults_under_request(defaults=as_dict(value), request_metadata=as_dict(kwargs[key]))
                 )
+        enforce_deployment_service_tier(data, kwargs)
         pinned: Final = deployment_model_id_pin(data)
         if pinned is not None:
             kwargs["model_id"] = pinned

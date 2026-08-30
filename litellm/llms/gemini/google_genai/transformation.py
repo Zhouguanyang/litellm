@@ -2,6 +2,7 @@
 Transformation for Calling Google models in their native format.
 """
 
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 
@@ -22,7 +23,6 @@ from litellm.types.router import GenericLiteLLMParams
 
 if TYPE_CHECKING:
     from litellm.types.google_genai.main import (
-        GenerateContentConfigDict,
         GenerateContentContentListUnionDict,
         GenerateContentResponse,
         ToolConfigDict,
@@ -108,7 +108,7 @@ class GoogleGenAIConfig(BaseGoogleGenAIGenerateContentConfig, VertexLLM):
 
     def map_generate_content_optional_params(
         self,
-        generate_content_config_dict: GenerateContentConfigDict,
+        generate_content_config_dict: Mapping[str, object],
         model: str,
     ) -> dict[str, object]:
         """

@@ -8,13 +8,16 @@ routing-plugin pipeline.
 
 import asyncio
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Final
 
 import pytest
 
 import litellm
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.router_core import RouterCore
+from litellm.router_rust.core import RustCore
+from litellm.router_rust.invoke.shaping import Shaping, update_kwargs_with_deployment
 from litellm.types.router import RoutingContext
 from tests.unit.test_router.core.scripted_host import ScriptedHost, deployment
 from tests.unit.test_router.core.selection_helpers import MESSAGES, MakeCore, picked_ids
@@ -76,6 +79,106 @@ def _metadata(request: Mapping[str, object]) -> Mapping[str, object]:
     metadata: Final = request.get("metadata")
     assert isinstance(metadata, Mapping)
     return metadata
+
+
+def _selected_service_tier(selected: Mapping[str, object], request: dict[str, object]) -> object:
+    update_kwargs_with_deployment(
+        Shaping(
+            default_litellm_params={}, timeout=None, explicit_timeout=None, request_timeout=None,
+            stream_timeout=None, cache_responses=False,
+        ),
+        selected,
+        request,
+        usage=None,
+    )
+    return request.get("service_tier")
+
+
+class _NestedTierSelection(CustomLogger):
+    def __init__(self, core: Callable[[], RustCore], entry: str) -> None:
+        super().__init__()
+        self.core = core
+        self.entry = entry
+        self.inner_tier: object = None
+        self.inner_failed = False
+
+    async def _pick(self) -> object:
+        request: Final[dict[str, object]] = {}
+        group: Final = "inner" if self.entry in ("pick", "sync_pick") else "inner-smart"
+        selected: Final = (
+            self.core().get_available_deployment(group, request_kwargs=request, messages=MESSAGES)
+            if self.entry == "sync_pick"
+            else await self.core().select(group, request, messages=MESSAGES)
+        )
+        assert isinstance(selected, Mapping)
+        return _selected_service_tier(selected, request)
+
+    async def async_filter_deployments(
+        self,
+        model: str,
+        healthy_deployments: list[dict[str, object]],
+        messages: object,
+        request_kwargs: object = None,
+        parent_otel_span: object = None,
+    ) -> list[dict[str, object]]:
+        if model == "inner" and self.entry == "error":
+            raise RuntimeError("nested selection failed")
+        if model == "inner" and self.entry == "cancel":
+            raise asyncio.CancelledError()
+        if model != "outer":
+            return healthy_deployments
+        try:
+            if self.entry == "call":
+                await self.core().acompletion(model="inner-smart", messages=MESSAGES)
+            elif self.entry == "task_pick":
+                self.inner_tier = await asyncio.create_task(self._pick())
+            else:
+                self.inner_tier = await self._pick()
+        except (RuntimeError, asyncio.CancelledError):
+            self.inner_failed = True
+        return healthy_deployments
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ("pick", "pinned_pick", "sync_pick", "call", "task_pick", "error", "cancel"))
+@pytest.mark.parametrize("select_only", (False, True))
+async def test_nested_selection_preserves_each_requests_service_tier(
+    make_core: MakeCore, host: ScriptedHost, entry: str, select_only: bool
+) -> None:
+    callback: Final = _NestedTierSelection(lambda: core, entry)
+    host.lists["callbacks"].append(callback)
+    core: Final = make_core(
+        model_list=[
+            deployment("outer", "outer-id", model="gemini/gemini-4-carbon", service_tier="default"),
+            deployment("inner", "inner-id", model="gemini/gemini-4-carbon", service_tier="default"),
+            _complexity_router(
+                "smart",
+                tiers={tier: {"model_name": "outer", "litellm_params": {"service_tier": "priority"}} for tier in TIERS},
+                complexity_router_default_model="outer",
+            ),
+            _complexity_router(
+                "inner-smart",
+                tiers={tier: {"model_name": "inner", "litellm_params": {"service_tier": "flex"}} for tier in TIERS},
+                deployment_id="inner-marker",
+                complexity_router_default_model="inner",
+            ),
+        ],
+        num_retries=0,
+    )
+    assert isinstance(core, RustCore)
+    if select_only:
+        request: Final[dict[str, object]] = {}
+        selected: Final = await core.select("smart", request, messages=MESSAGES)
+        assert isinstance(selected, Mapping)
+        assert _selected_service_tier(selected, request) == "priority"
+    else:
+        await core.acompletion(model="smart", messages=MESSAGES)
+        assert host.calls[-1].kwargs["service_tier"] == "priority"
+    assert callback.inner_failed == (entry in ("error", "cancel"))
+    if entry not in ("call", "error", "cancel"):
+        assert callback.inner_tier == ("default" if entry in ("pick", "sync_pick") else "flex")
+    if entry == "call":
+        assert host.calls[0].kwargs["service_tier"] == "flex"
 
 
 # --- the complexity router ------------------------------------------------------------------------

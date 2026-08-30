@@ -8,7 +8,9 @@ the same precedence and the same oddities. Nothing here reads a Python router.
 """
 
 import dataclasses
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Generator, Mapping, MutableMapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -61,6 +63,10 @@ ROUTER_CLIENTS_TARGET: Final = "router_clients"
 _MAPPING: Final = TypeAdapter(Mapping[str, object])
 _FORWARDED_CREDENTIAL_ISOLATION_PROVIDERS: Final = frozenset({"chatgpt", "anthropic"})
 _ALIAS_MARKER_FORWARDED_PARAMS_KWARG: Final = "_alias_marker_forwarded_params"
+_PRE_ROUTING_SERVICE_TIER: Final[ContextVar[Mapping[str, object] | None]] = ContextVar(
+    "pre_routing_service_tier", default=None
+)
+_SELECTED_SERVICE_TIER: Final[ContextVar[Mapping[str, object] | None]] = ContextVar("selected_service_tier", default=None)
 # Generic handlers whose stream timeout is split from the request timeout.
 STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS: Final = frozenset({"anthropic_messages", "aresponses", "responses"})
 
@@ -395,6 +401,58 @@ def _clientside_deployment(
 # --- the deployment --------------------------------------------------------------------------
 
 
+@contextmanager
+def pre_routing_service_tier_scope(*, handoff: bool = False) -> Generator[None, None, None]:
+    routing_token: Final = _PRE_ROUTING_SERVICE_TIER.set(None)
+    selected_token: Final = _SELECTED_SERVICE_TIER.set(None)
+    try:
+        yield
+        selected: Final = _PRE_ROUTING_SERVICE_TIER.get()
+    finally:
+        _PRE_ROUTING_SERVICE_TIER.reset(routing_token)
+        _SELECTED_SERVICE_TIER.reset(selected_token)
+    if handoff:
+        _SELECTED_SERVICE_TIER.set(selected)
+
+
+def set_pre_routing_service_tier(request: Mapping[str, object] | None) -> None:
+    _PRE_ROUTING_SERVICE_TIER.set(request)
+
+
+def _take_pre_routing_service_tier(request: Mapping[str, object]) -> bool:
+    routing: Final = _PRE_ROUTING_SERVICE_TIER.get() is request
+    selected: Final = _SELECTED_SERVICE_TIER.get() is request
+    if routing:
+        _PRE_ROUTING_SERVICE_TIER.set(None)
+    if selected:
+        _SELECTED_SERVICE_TIER.set(None)
+    return routing or selected
+
+
+def carry_pre_routing_service_tier(source: Mapping[str, object], target: Mapping[str, object]) -> None:
+    if _take_pre_routing_service_tier(source):
+        _PRE_ROUTING_SERVICE_TIER.set(target)
+
+
+def enforce_deployment_service_tier(
+    deployment_params: Mapping[str, object],
+    kwargs: MutableMapping[str, object],
+    default_litellm_params: Mapping[str, object] = MappingProxyType({}),
+) -> None:
+    pinned: Final = _take_pre_routing_service_tier(kwargs)
+    kwargs.pop("_pre_routing_litellm_param_keys", None)
+    configured: Final = deployment_params.get("service_tier")
+    if configured is None:
+        return
+    if not pinned:
+        kwargs["service_tier"] = configured  # rebind-ok: fill request-owned kwargs
+    extra_body: Final = _mapping(
+        kwargs.get("extra_body", default_litellm_params.get("extra_body", deployment_params.get("extra_body")))
+    )
+    if extra_body is not None:
+        kwargs["extra_body"] = without(extra_body, "service_tier", "serviceTier")  # rebind-ok: replace request-owned kwargs
+
+
 def update_kwargs_with_deployment(
     shaping: Shaping,
     deployment: Mapping[str, object],
@@ -414,6 +472,7 @@ def update_kwargs_with_deployment(
     kwargs.pop("daily_reset_time", None)
     defaults: Final = shaping.default_litellm_params
     merge_tools_from_deployment(deployment_params, kwargs, defaults)
+    enforce_deployment_service_tier(deployment_params, kwargs, defaults)
 
     model_info: Mapping[str, object] = as_dict(  # rebind-ok: rebound as the Python router rebinds it
         deployment.get("model_info")

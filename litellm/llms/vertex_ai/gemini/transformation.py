@@ -35,6 +35,7 @@ from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
 )
 from litellm.litellm_core_utils.prompt_templates.image_handling import RemoteMedia, async_inline_remote_media
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+from litellm.llms.gemini.common_utils import gemini_service_tier
 from litellm.llms.vertex_ai.common_utils import pop_vertex_caller_labels, pop_vertex_request_labels
 from litellm.llms.vertex_ai.request_labels import vertex_request_label_fields
 from litellm.types.files import (
@@ -1260,13 +1261,7 @@ def transform_request_body(
             data["cachedContent"] = cached_content
 
         if service_tier := optional_params.pop("service_tier", None):
-            if isinstance(service_tier, str):
-                if service_tier.lower() == "default":
-                    data["serviceTier"] = "standard"
-                else:
-                    data["serviceTier"] = service_tier.lower()
-            else:
-                data["serviceTier"] = service_tier
+            data["serviceTier"] = gemini_service_tier(service_tier) if isinstance(service_tier, str) else service_tier
 
         if continuation_token := optional_params.pop("continuation_token", None):
             data["continuationToken"] = continuation_token
