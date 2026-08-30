@@ -22,6 +22,7 @@ import traceback
 import weakref
 from collections import defaultdict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from functools import lru_cache, partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, TypeAlias, TypeVar, Union, cast
@@ -376,6 +377,12 @@ _RUNTIME_TOGGLEABLE_PRE_CALL_CHECKS: Final[Mapping[str, type[CustomLogger]]] = M
         "prompt_caching": PromptCachingDeploymentCheck,
         "enforce_model_rate_limits": ModelRateLimitingCheck,
     }
+)
+
+_PRE_ROUTING_LITELLM_PARAM_KEYS_KWARG: Final = "_pre_routing_litellm_param_keys"
+_PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT: Final[ContextVar[tuple[int, tuple[str, ...]] | None]] = ContextVar(
+    "pre_routing_litellm_param_keys",
+    default=None,
 )
 
 
@@ -3601,6 +3608,17 @@ class Router:
         if "tool_choice" not in kwargs and dep_params.get("tool_choice") is not None:
             kwargs["tool_choice"] = dep_params["tool_choice"]
 
+    @staticmethod
+    def _enforce_deployment_service_tier(
+        deployment: dict,
+        kwargs: dict,
+        higher_precedence_param_keys: Sequence[str] = (),
+    ) -> None:
+        deployment_litellm_params: Final = deployment["litellm_params"]
+        deployment_service_tier: Final = deployment_litellm_params.get("service_tier")
+        if deployment_service_tier is not None and "service_tier" not in higher_precedence_param_keys:
+            kwargs["service_tier"] = deployment_service_tier
+
     def _update_kwargs_with_deployment(
         self,
         deployment: dict,
@@ -3608,11 +3626,18 @@ class Router:
         function_name: str | None = None,
     ) -> None:
         """
-        3 jobs:
+        4 jobs:
         - Adds selected deployment, model_info and api_base to kwargs["metadata"] (used for logging)
         - Adds default litellm params to kwargs, if set.
         - Merges tools from deployment with request (proxy-configured tools + request tools).
+        - Enforces a deployment-level service_tier over request params while preserving pre-routing tier overrides.
         """
+        kwargs.pop(_PRE_ROUTING_LITELLM_PARAM_KEYS_KWARG, None)
+        pre_routing_context: Final = _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.get()
+        _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set(None)
+        pre_routing_litellm_param_keys: Final = (
+            pre_routing_context[1] if pre_routing_context is not None and pre_routing_context[0] == id(kwargs) else ()
+        )
         for key in self._forwarded_alias_marker_keys_the_deployment_sets(
             deployment=deployment, forwarded_keys=kwargs.pop(_ALIAS_MARKER_FORWARDED_PARAMS_KWARG, ())
         ):
@@ -3689,6 +3714,12 @@ class Router:
             kwargs["timeout"] = self._get_timeout(kwargs=kwargs, data=deployment["litellm_params"])
 
         self._update_kwargs_with_default_litellm_params(kwargs=kwargs, metadata_variable_name=metadata_variable_name)
+
+        self._enforce_deployment_service_tier(
+            deployment=deployment,
+            kwargs=kwargs,
+            higher_precedence_param_keys=pre_routing_litellm_param_keys,
+        )
 
     def _get_async_openai_model_client(self, deployment: dict, kwargs: dict):
         """
@@ -4195,6 +4226,7 @@ class Router:
         filtered_data: Final = {k: v for k, v in data.items() if k not in prompt_management_params}
 
         kwargs = {**filtered_data, **kwargs, **optional_params}
+        self._enforce_deployment_service_tier(deployment=prompt_management_deployment, kwargs=kwargs)
         kwargs["model"] = model
         kwargs["messages"] = messages
         kwargs["litellm_logging_obj"] = litellm_logging_object
@@ -4650,6 +4682,7 @@ class Router:
                     kwargs[k] = v
                 elif k == "metadata":
                     kwargs[k].update(v)
+            self._enforce_deployment_service_tier(deployment=deployment, kwargs=kwargs)
 
             # call via litellm.completion()
             return litellm.text_completion(**{**data, "prompt": prompt, "caching": self.cache_responses, **kwargs})
@@ -12517,6 +12550,7 @@ class Router:
 
         Allows all cache calls to be made async => 10x perf impact (8rps -> 100 rps).
         """
+        _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set(None)
         if (
             self.routing_strategy != "usage-based-routing-v2"
             and self.routing_strategy != "simple-shuffle"
@@ -12555,6 +12589,8 @@ class Router:
                     )
                     self._drop_client_effort_carriers_a_tier_pin_supersedes(request_kwargs, accepted_tier_params)
                     request_kwargs.update(accepted_tier_params)
+                    if accepted_tier_params:
+                        _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set((id(request_kwargs), tuple(accepted_tier_params)))
             #########################################################
 
             # Resolve the strategy and logger AFTER the pre-routing hook, since
@@ -12651,6 +12687,7 @@ class Router:
         Only returns deployments configured with use_in_pass_through=True
         """
         try:
+            _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set(None)
             parent_otel_span: Final = _get_parent_otel_span_from_kwargs(request_kwargs)
 
             # 1. Execute pre-routing hook
@@ -12671,6 +12708,8 @@ class Router:
                     )
                     self._drop_client_effort_carriers_a_tier_pin_supersedes(request_kwargs, accepted_tier_params)
                     request_kwargs.update(accepted_tier_params)
+                    if accepted_tier_params:
+                        _PRE_ROUTING_LITELLM_PARAM_KEYS_CONTEXT.set((id(request_kwargs), tuple(accepted_tier_params)))
 
             # 2. Get healthy deployments
             healthy_deployments: Final = await self.async_get_healthy_deployments(
@@ -13093,6 +13132,9 @@ class Router:
                 request_tags=_get_tags_from_request_kwargs(request_kwargs),
             ),
         )
+        pre_routing_litellm_param_keys: Final = (
+            tuple(pre_routing_hook_response.litellm_params or ()) if pre_routing_hook_response is not None else ()
+        )
 
         # `model` (the alias, e.g. "smart-router") is never the deployment actually
         # called - apply the router marker's own litellm_params to the request,
@@ -13118,11 +13160,10 @@ class Router:
             if pre_routing_hook_response is not None
             else ()
         )
-        tier_param_keys: Final = (
-            tuple(pre_routing_hook_response.litellm_params or ()) if pre_routing_hook_response is not None else ()
-        )
         newly_forwarded: Final = tuple(
-            (key, value) for key, value in marker_params if key not in request_kwargs and key not in tier_param_keys
+            (key, value)
+            for key, value in marker_params
+            if key not in request_kwargs and key not in pre_routing_litellm_param_keys
         )
         request_kwargs.pop(_ALIAS_MARKER_FORWARDED_PARAMS_KWARG, None)
         request_kwargs.update(newly_forwarded)
