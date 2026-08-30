@@ -112,7 +112,7 @@ from litellm.router_rust.invoke.endpoints import (
     stamp_error,
     unrouted_fields,
 )
-from litellm.router_rust.invoke.shaping import Shaping
+from litellm.router_rust.invoke.shaping import Shaping, pre_routing_service_tier_scope
 from litellm.router_rust.invoke.slots import enter_deployment_slot, max_parallel_requests_limit
 from litellm.router_rust.invoke.streaming import (
     StreamAttempt,
@@ -2950,7 +2950,8 @@ class RustCore(
             self, plan, prepared, cut_deployment, stream_failure, fresh=fresh, passthrough=passthrough
         )
         try:
-            return await self._run_steps(driver, call)
+            with pre_routing_service_tier_scope():
+                return await self._run_steps(driver, call)
         except BaseException:
             driver.close_route_phase()
             raise
@@ -3014,35 +3015,36 @@ class RustCore(
         *,
         fresh: bool = False,
     ) -> "tuple[_Driver, Mapping[str, object]]":
-        driver: Final = _Driver(self, plan, prepared, cut_deployment, stream_failure, sync=True, fresh=fresh)
-        outcome: object = None  # rebind-ok: the answer to the last step
-        while True:
-            step = call.next(outcome)
-            driver.take_events(step.get("events"))
-            if step["kind"] != "done":  # see _run
-                driver.log_outcomes_sync()
-            match step["kind"]:
-                case "attempt":
-                    outcome = driver.attempt_sync(step)
-                case "sleep":
-                    self._host.sleep_sync(_sleep_seconds(step))
-                    outcome = None
-                case "allow_fallback":
-                    from litellm.litellm_core_utils import asyncify
+        with pre_routing_service_tier_scope():
+            driver: Final = _Driver(self, plan, prepared, cut_deployment, stream_failure, sync=True, fresh=fresh)
+            outcome: object = None  # rebind-ok: the answer to the last step
+            while True:
+                step = call.next(outcome)
+                driver.take_events(step.get("events"))
+                if step["kind"] != "done":  # see _run
+                    driver.log_outcomes_sync()
+                match step["kind"]:
+                    case "attempt":
+                        outcome = driver.attempt_sync(step)
+                    case "sleep":
+                        self._host.sleep_sync(_sleep_seconds(step))
+                        outcome = None
+                    case "allow_fallback":
+                        from litellm.litellm_core_utils import asyncify
 
-                    outcome = asyncify.run_async_function(driver.allow_fallback, str(step["target"]))  # pyright: ignore[reportUnknownMemberType]  # the untyped sync bridge
-                case "refuse_fallbacks":
-                    outcome = driver.refuse_fallbacks(step)
-                case "cache":
-                    outcome = self._answer_cache_sync(step)
-                case "select":
-                    outcome = driver.select_sync(step)
-                case "pre_route":
-                    outcome = driver.pre_route_sync(step)
-                case "done" | "failed":
-                    return driver, step
-                case other:  # pyright: ignore[reportUnnecessaryComparison]  # a kind the bridge returns but the stub does not list
-                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+                        outcome = asyncify.run_async_function(driver.allow_fallback, str(step["target"]))  # pyright: ignore[reportUnknownMemberType]  # the untyped sync bridge
+                    case "refuse_fallbacks":
+                        outcome = driver.refuse_fallbacks(step)
+                    case "cache":
+                        outcome = self._answer_cache_sync(step)
+                    case "select":
+                        outcome = driver.select_sync(step)
+                    case "pre_route":
+                        outcome = driver.pre_route_sync(step)
+                    case "done" | "failed":
+                        return driver, step
+                    case other:  # pyright: ignore[reportUnnecessaryComparison]  # a kind the bridge returns but the stub does not list
+                        raise RuntimeError(f"router-core returned an unknown step {other!r}")
 
     # -- stream recovery (the host's stream wrappers, router_rust.invoke.streaming) ---------------------
 
@@ -3193,6 +3195,9 @@ class RustCore(
         instead of the step's ``model``, a custom strategy's deployment, or ``None``. ``pass_through``
         is ``_async_get_available_deployment_for_pass_through``, which runs the hook whatever the
         router's strategy and which no replaced pick answers."""
+        from litellm.router_rust.invoke.shaping import set_pre_routing_service_tier
+
+        set_pre_routing_service_tier(None)
         assigned: Final[object] = None if pass_through else self.__dict__.get("_core_async_get_available_deployment")
         if callable(assigned):
             # The async pick assigned through the deprecated attribute answers, as Python's
@@ -3278,6 +3283,9 @@ class RustCore(
         specific_deployment: object = _NO_INPUT,
     ) -> object:
         """A custom strategy's sync pick (``get_available_deployment``); without one, no pre-routing."""
+        from litellm.router_rust.invoke.shaping import set_pre_routing_service_tier
+
+        set_pre_routing_service_tier(None)
         custom: Final = self._custom_strategy
         if custom is None:
             return None
@@ -4167,6 +4175,7 @@ class _Selection:
 
         with (
             phase_span(f"route {self._model}"),
+            pre_routing_service_tier_scope(handoff=True),
             self._core._usage_read_scope(str(self._model), self._request),  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
         ):
             return await self._run()
@@ -4223,29 +4232,30 @@ class _Selection:
         return done if discovery is None else discovery.resolve_deployment(done, self._request)
 
     def run_sync(self) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
-        core: Final = self._core
-        outcome: object = None  # rebind-ok: the answer to the last step
-        while True:
-            step = self._call.next(outcome)
-            match step["kind"]:
-                case "cache":
-                    outcome = core._answer_cache_sync(step)  # pyright: ignore[reportPrivateUsage]  # see above
-                case "select":
-                    outcome = core._answer_select_sync(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
-                case "pre_route":
-                    outcome = core._custom_pick_sync(  # pyright: ignore[reportPrivateUsage]  # see above
-                        step, self._request, self._messages, self._input, self._specific_deployment
-                    )
-                case "done":
-                    done = self._done(step)
-                    if self._kind != "sync_pick" or not isinstance(done, Mapping):
-                        return done
-                    # `get_available_deployment` resolves its pick to a pod.
-                    return self._resolved_pod_sync(core, done)
-                case "failed":
-                    raise self._failed(step, sync=True)
-                case other:  # pyright: ignore[reportUnnecessaryComparison]  # a kind the bridge returns but the stub does not list
-                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+        with pre_routing_service_tier_scope(handoff=True):
+            core: Final = self._core
+            outcome: object = None  # rebind-ok: the answer to the last step
+            while True:
+                step = self._call.next(outcome)
+                match step["kind"]:
+                    case "cache":
+                        outcome = core._answer_cache_sync(step)  # pyright: ignore[reportPrivateUsage]  # see above
+                    case "select":
+                        outcome = core._answer_select_sync(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
+                    case "pre_route":
+                        outcome = core._custom_pick_sync(  # pyright: ignore[reportPrivateUsage]  # see above
+                            step, self._request, self._messages, self._input, self._specific_deployment
+                        )
+                    case "done":
+                        done = self._done(step)
+                        if self._kind != "sync_pick" or not isinstance(done, Mapping):
+                            return done
+                        # `get_available_deployment` resolves its pick to a pod.
+                        return self._resolved_pod_sync(core, done)
+                    case "failed":
+                        raise self._failed(step, sync=True)
+                    case other:  # pyright: ignore[reportUnnecessaryComparison]  # a kind the bridge returns but the stub does not list
+                        raise RuntimeError(f"router-core returned an unknown step {other!r}")
 
 
 def _log_refused_pick(request: Mapping[str, object], error: BaseException) -> None:
@@ -4938,10 +4948,14 @@ class _Driver:
         level: Final = step.get("fallback_level")
         # The request params the walk's dict targets merged in (`kwargs.update(target)`).
         params: Final = as_str_mapping(step.get("params"))
+        from litellm.router_rust.invoke.shaping import carry_pre_routing_service_tier
+
+        attempt_request: Final = self._request if params is None else {**self._request, **params}
+        carry_pre_routing_service_tier(self._request, attempt_request)
         call: Final = attempt_call(
             self._core._port,  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
             self._plan,
-            self._request if params is None else {**self._request, **params},
+            attempt_request,
             deployment,
             group=requested,
             requested=requested,

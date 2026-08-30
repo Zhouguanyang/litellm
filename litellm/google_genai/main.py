@@ -1,5 +1,6 @@
 import asyncio
 import contextvars
+from collections.abc import Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
@@ -16,6 +17,7 @@ from litellm.llms.base_llm.google_genai.transformation import (
     BaseGoogleGenAIGenerateContentConfig,
 )
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+from litellm.llms.gemini.common_utils import gemini_service_tier
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.router import GenericLiteLLMParams
@@ -40,6 +42,7 @@ else:
 # Initialize any necessary instances or variables here
 base_llm_http_handler = BaseLLMHTTPHandler()
 _GENERATE_CONTENT_RESULT: Final = TypeAdapter(object)
+_GENERATE_CONTENT_PARAMS: Final = TypeAdapter(Mapping[str, object])
 #################################################
 
 
@@ -96,6 +99,7 @@ class GenerateContentHelper:
         config: GenerateContentConfigDict | None = None,
         custom_llm_provider: str | None = None,
         tools: ToolConfigDict | None = None,
+        extra_body: Mapping[str, object] | None = None,
         **kwargs,
     ) -> GenerateContentSetupResult:
         """
@@ -107,6 +111,7 @@ class GenerateContentHelper:
             config: Optional configuration
             custom_llm_provider: Optional custom LLM provider
             tools: Optional tools
+            extra_body: Additional top-level request fields
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -171,18 +176,41 @@ class GenerateContentHelper:
         # Construct request body
         #########################################################################################
         # Create Google Optional Params Config
+        config_params: Final = _GENERATE_CONTENT_PARAMS.validate_python(config or {})
+        native_params: Final = _GENERATE_CONTENT_PARAMS.validate_python(kwargs)
+        generation_config: Final = {
+            key: value for key, value in config_params.items() if key not in ("service_tier", "serviceTier")
+        }
         generate_content_config_dict: Final = generate_content_provider_config.map_generate_content_optional_params(
-            generate_content_config_dict=config or {},
+            generate_content_config_dict=generation_config,
             model=model,
         )
         # Extract systemInstruction from kwargs to pass to transform
         system_instruction: Final = kwargs.get("systemInstruction") or kwargs.get("system_instruction")
         # Native top-level REST fields arrive as loose kwargs and are otherwise dropped.
-        native_request_fields: Final[dict[str, object]] = {
-            field: kwargs[field]
+        native_fields: Final[dict[str, object]] = {
+            field: native_params[field]
             for field in generate_content_provider_config.get_generate_content_request_top_level_fields()
-            if field in kwargs
+            if field in native_params
         }
+        service_tier: Final[object] = next(
+            (
+                value
+                for value in (
+                    native_params.get("service_tier"),
+                    native_params.get("serviceTier"),
+                    config_params.get("service_tier"),
+                    config_params.get("serviceTier"),
+                )
+                if value is not None
+            ),
+            None,
+        )
+        native_request_fields: Final = {
+            **native_fields,
+            **({"serviceTier": gemini_service_tier(service_tier)} if isinstance(service_tier, str) else {}),
+        }
+        request_service_tier: Final = (extra_body or {}).get("serviceTier", native_request_fields.get("serviceTier"))
         request_body: Final = generate_content_provider_config.transform_generate_content_request(
             model=model,
             contents=contents,
@@ -199,7 +227,14 @@ class GenerateContentHelper:
         litellm_logging_obj.update_from_kwargs(
             kwargs=kwargs,
             model=model,
-            optional_params=dict(generate_content_config_dict),
+            optional_params={
+                **generate_content_config_dict,
+                **(
+                    {"service_tier": gemini_service_tier(request_service_tier)}
+                    if isinstance(request_service_tier, str)
+                    else {}
+                ),
+            },
             litellm_params={
                 "litellm_call_id": litellm_call_id,
                 **({"vertex_location": vertex_location} if vertex_location else {}),
@@ -344,6 +379,7 @@ def generate_content(
             config=config,
             custom_llm_provider=custom_llm_provider,
             tools=tools,
+            extra_body=extra_body,
             **kwargs,
         )
 
@@ -437,6 +473,7 @@ async def agenerate_content_stream(
             config=config,
             custom_llm_provider=custom_llm_provider,
             tools=tools,
+            extra_body=extra_body,
             **kwargs,
         )
 
@@ -529,6 +566,7 @@ def generate_content_stream(
             config=config,
             custom_llm_provider=custom_llm_provider,
             tools=tools,
+            extra_body=extra_body,
             **kwargs,
         )
 

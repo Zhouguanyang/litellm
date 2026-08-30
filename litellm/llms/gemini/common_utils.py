@@ -119,6 +119,11 @@ GEMINI_IMAGE_SIZE_TO_ASPECT_RATIO: Final[dict[tuple[int, int], str]] = {
 }
 
 
+def gemini_service_tier(value: str) -> str:
+    tier: Final = value.lower()
+    return {"auto": "priority", "default": "standard"}.get(tier, tier)
+
+
 def map_openai_size_to_gemini_image_config(size: str, model: str) -> dict[str, str] | None:
     dimensions: Final = _parse_openai_image_size(size)
     if dimensions is None:

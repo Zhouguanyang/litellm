@@ -8,7 +8,6 @@ import httpx
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.google_genai.main import (
-        GenerateContentConfigDict,
         GenerateContentContentListUnionDict,
         GenerateContentResponse,
         ToolConfigDict,
@@ -78,7 +77,7 @@ class BaseGoogleGenAIGenerateContentConfig(ABC):
     @abstractmethod
     def map_generate_content_optional_params(
         self,
-        generate_content_config_dict: GenerateContentConfigDict,
+        generate_content_config_dict: Mapping[str, object],
         model: str,
     ) -> dict[str, object]:
         """

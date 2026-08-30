@@ -4,15 +4,143 @@ Test to verify the Google GenAI generate_content adapter functionality
 """
 
 import json
-from collections.abc import Iterator
-from typing import Final
+from collections.abc import AsyncIterable, Iterator
+from datetime import datetime, timezone
+from typing import Final, Literal, assert_never
 
+import httpx
 import pytest
-
-
-
+import respx
+from pydantic import JsonValue, TypeAdapter
 
 import litellm
+from litellm.google_genai import main as genai_main
+from litellm.litellm_core_utils.litellm_logging import Logging
+
+_NATIVE_TIER_BODY: Final = TypeAdapter(dict[str, JsonValue])
+
+
+async def _native_tier_call(
+    call_type: Literal["sync", "async", "sync_stream", "async_stream"],
+    tier_params: dict[str, object],
+) -> object:
+    request: Final = {
+        "model": "gemini/gemini-4-carbon",
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        "api_key": "synthetic-native-tier-key",
+        "api_base": "https://native-tier.test",
+        **tier_params,
+    }
+    match call_type:
+        case "sync":
+            return genai_main.generate_content(**request)
+        case "async":
+            return await genai_main.agenerate_content(**request)
+        case "sync_stream":
+            return genai_main.generate_content_stream(**request)
+        case "async_stream":
+            return await genai_main.agenerate_content_stream(**request)
+        case _:
+            assert_never(call_type)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ("sync", "async", "sync_stream", "async_stream"))
+@pytest.mark.parametrize("field", ("service_tier", "serviceTier"))
+@pytest.mark.parametrize("in_config", (False, True, None))
+@pytest.mark.parametrize("tier,expected", (("FLEX", "flex"), ("priority", "priority"), ("auto", "priority")))
+async def test_native_service_tier_is_top_level_for_every_entrypoint(
+    call_type: Literal["sync", "async", "sync_stream", "async_stream"],
+    field: str,
+    in_config: bool | None,
+    tier: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
+    rates: Final = {
+        "input_cost_per_token": 0.001,
+        "output_cost_per_token": 0.002,
+        "input_cost_per_token_flex": 0.0005,
+        "output_cost_per_token_flex": 0.001,
+        "input_cost_per_token_priority": 0.002,
+        "output_cost_per_token_priority": 0.004,
+    }
+    monkeypatch.setitem(litellm.model_cost, "gemini/gemini-4-carbon", {"litellm_provider": "gemini", **rates})
+    logging_obj: Final = Logging(
+        model="gemini/gemini-4-carbon",
+        messages=[],
+        stream=call_type.endswith("stream"),
+        call_type={
+            "sync": "generate_content",
+            "async": "agenerate_content",
+            "sync_stream": "generate_content_stream",
+            "async_stream": "agenerate_content_stream",
+        }[call_type],
+        start_time=datetime(2026, 11, 15, tzinfo=timezone.utc),
+        litellm_call_id="native-tier-cost",
+        function_id="native-tier-cost",
+    )
+    tier_params: Final[dict[str, object]] = {
+        **(
+            {"service_tier": "default", "extra_body": {"serviceTier": expected}}
+            if in_config is None
+            else {"config": {field: tier}} if in_config else {field: tier}
+        ),
+        "litellm_logging_obj": logging_obj,
+    }
+    reply: Final = {
+        "responseId": "native-tier-response",
+        "modelVersion": "gemini-4-carbon",
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": [{"text": "tier reply"}]},
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+        "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 2, "totalTokenCount": 4},
+    }
+    streaming: Final = call_type.endswith("stream")
+    with respx.mock() as upstream:
+        route: Final = upstream.post(url__regex=r"https://native-tier\.test/.*").mock(
+            return_value=(
+                httpx.Response(
+                    200, headers={"content-type": "text/event-stream"}, content=f"data: {json.dumps(reply)}\n\n"
+                )
+                if streaming
+                else httpx.Response(200, json=reply)
+            )
+        )
+        response: Final = await _native_tier_call(call_type, tier_params)
+        if call_type == "async_stream":
+            assert isinstance(response, AsyncIterable)
+            assert tuple([chunk async for chunk in response])
+        elif call_type == "sync_stream":
+            assert isinstance(response, Iterator)
+            assert tuple(response)
+        else:
+            assert response is not None
+        assert len(route.calls) == 1
+        body: Final = _NATIVE_TIER_BODY.validate_json(route.calls[0].request.content)
+        assert body == {
+            "model": "gemini-4-carbon",
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "tools": None,
+            "generationConfig": {},
+            "serviceTier": expected,
+        }
+        expected_cost: Final = 2 * rates[f"input_cost_per_token_{expected}"] + 2 * rates[
+            f"output_cost_per_token_{expected}"
+        ]
+        billed_response: Final = litellm.VertexGeminiConfig().transform_google_generate_content_to_openai_model_response(
+            completion_response=reply,
+            model_response=litellm.ModelResponse(),
+            model="gemini-4-carbon",
+            logging_obj=logging_obj,
+            raw_response=httpx.Response(200, json=reply),
+        )
+        assert logging_obj.response_cost_calculator(result=billed_response) == pytest.approx(expected_cost)
 
 
 @pytest.mark.asyncio
