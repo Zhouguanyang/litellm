@@ -599,6 +599,23 @@ def test_openrouter_reasoning_effort_xhigh_passes_through():
     assert result["reasoning_effort"] == "xhigh"
 
 
+def test_openrouter_responses_reasoning_dict_maps_to_chat_reasoning_effort():
+    config = OpenrouterConfig()
+    original_params = {"reasoning_effort": {"effort": "xhigh", "summary": "auto"}}
+
+    result = config.map_openai_params(
+        non_default_params=original_params,
+        optional_params={},
+        model="openrouter/deepseek/deepseek-r1",
+        drop_params=False,
+    )
+
+    assert result["reasoning_effort"] == "xhigh"
+    assert original_params == {
+        "reasoning_effort": {"effort": "xhigh", "summary": "auto"}
+    }
+
+
 def test_openrouter_reasoning_effort_high_passes_through():
     """
     Non-max reasoning_effort values should be forwarded unchanged.
