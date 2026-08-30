@@ -40,8 +40,6 @@ COPY --from=uvbin /uvx /usr/local/bin/uvx
 RUN apk add --no-cache \
     bash \
     gcc \
-    python3 \
-    python3-dev \
     rust \
     openssl \
     openssl-dev \
@@ -50,6 +48,8 @@ RUN apk add --no-cache \
     libsndfile
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_PYTHON_INSTALL_DIR=/app/.uv-python \
+    UV_MANAGED_PYTHON=1 \
     UV_LINK_MODE=copy \
     PATH="/app/.venv/bin:${PATH}"
 
@@ -65,7 +65,7 @@ RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-gr
     --extra extra_proxy \
     --extra semantic-router \
     --extra saml \
-    --python python3
+    --python 3.12
 
 # Copy full source tree
 COPY . .
@@ -86,7 +86,7 @@ RUN uv sync --frozen --no-default-groups --no-editable \
     --extra extra_proxy \
     --extra semantic-router \
     --extra saml \
-    --python python3
+    --python 3.12
 
 RUN HOME=/opt/prisma XDG_CACHE_HOME=/opt/prisma/.cache PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries \
     npm_config_cache=/root/.npm \
@@ -101,7 +101,7 @@ FROM $LITELLM_RUNTIME_IMAGE AS runtime
 USER root
 
 # node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python3 libsndfile
+RUN apk add --no-cache bash openssl tzdata nodejs libsndfile
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:${PATH}" \
@@ -128,6 +128,7 @@ COPY --from=builder /app/litellm-proxy-extras /app/litellm-proxy-extras
 # pinned via PRISMA_BINARY_CACHE_DIR / PRISMA_CLI_PATH and recorded into the
 # generated client at build time, so `prisma migrate deploy` on a fresh
 # database needs no npm and no network access (#33650, #24554).
+COPY --from=builder /app/.uv-python /app/.uv-python
 COPY --from=builder /opt/prisma /opt/prisma
 
 RUN find /app/.venv -type f -path "*/tornado/test/*" -delete && \
@@ -135,6 +136,7 @@ RUN find /app/.venv -type f -path "*/tornado/test/*" -delete && \
     chmod -R a+rX /opt/prisma && \
     test -x /opt/prisma/binaries/node_modules/.bin/prisma && \
     test -f /opt/prisma/binaries/node_modules/prisma/build/index.js && \
+    python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version" && \
     python -c "from prisma.client import BINARY_PATHS; paths = list(BINARY_PATHS.query_engine.values()); assert paths and all(p.startswith('/opt/prisma/') for p in paths), paths"
 
 EXPOSE 4000/tcp

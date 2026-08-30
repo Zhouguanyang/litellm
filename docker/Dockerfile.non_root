@@ -37,8 +37,6 @@ COPY --from=uvbin /uvx /usr/local/bin/uvx
 
 RUN for i in 1 2 3; do \
       apk add --no-cache \
-        python3 \
-        python3-dev \
         gcc \
         rust \
         bash \
@@ -51,6 +49,8 @@ RUN for i in 1 2 3; do \
     done
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_PYTHON_INSTALL_DIR=/app/.uv-python \
+    UV_MANAGED_PYTHON=1 \
     UV_LINK_MODE=copy \
     PATH="/app/.venv/bin:${PATH}" \
     LITELLM_NON_ROOT=true \
@@ -69,7 +69,7 @@ RUN --mount=type=cache,target=/app/.cache/uv,id=litellm-uv-cache \
     --extra extra_proxy \
     --extra semantic-router \
     --extra saml \
-    --python python3
+    --python 3.12
 
 # Copy full source tree
 COPY . .
@@ -96,7 +96,7 @@ RUN --mount=type=cache,target=/app/.cache/uv,id=litellm-uv-cache \
         --extra extra_proxy \
         --extra semantic-router \
         --extra saml \
-        --python python3 \
+        --python 3.12 \
         --no-sources-package litellm-proxy-extras; \
     else \
       uv sync --frozen --no-default-groups --no-editable \
@@ -105,7 +105,7 @@ RUN --mount=type=cache,target=/app/.cache/uv,id=litellm-uv-cache \
         --extra extra_proxy \
         --extra semantic-router \
         --extra saml \
-        --python python3; \
+        --python 3.12; \
     fi
 
 RUN HOME=/opt/prisma XDG_CACHE_HOME=/opt/prisma/.cache PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries \
@@ -124,7 +124,7 @@ RUN for i in 1 2 3; do \
       apk upgrade --no-cache && break || sleep 5; \
     done && \
     for i in 1 2 3; do \
-      apk add --no-cache python3 bash openssl tzdata libsndfile nodejs && break || sleep 5; \
+      apk add --no-cache bash openssl tzdata libsndfile nodejs && break || sleep 5; \
     done
 
 # Copy only what runtime needs. The application is installed inside the venv;
@@ -148,6 +148,7 @@ COPY --from=builder /app/litellm-proxy-extras /app/litellm-proxy-extras
 # and no network access; without it the CLI looks for the library engine, which
 # prisma stopped baking, and falls back to a download that fails offline or as a
 # non-writable uid (#33650, #24554).
+COPY --from=builder /app/.uv-python /app/.uv-python
 COPY --from=builder /opt/prisma /opt/prisma
 COPY --from=builder /var/lib/litellm/ui /var/lib/litellm/ui
 COPY --from=builder /var/lib/litellm/assets /var/lib/litellm/assets
@@ -170,6 +171,7 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 
 RUN mkdir -p /nonexistent /app/.cache /var/lib/litellm/assets /var/lib/litellm/ui && \
     chown -R nobody:nogroup /app /var/lib/litellm/ui /var/lib/litellm/assets /nonexistent && \
+    python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version" && \
     PRISMA_PATH=$(python -c "import os, prisma; print(os.path.dirname(prisma.__file__))") && \
     chown -R nobody:nogroup "$PRISMA_PATH" && \
     LITELLM_PKG_MIGRATIONS_PATH="$(python -c 'import os, litellm_proxy_extras; print(os.path.dirname(litellm_proxy_extras.__file__))' 2>/dev/null || echo '')/migrations" && \
