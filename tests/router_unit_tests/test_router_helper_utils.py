@@ -1,5 +1,6 @@
 import os
 import traceback
+from typing import Final
 from dotenv import load_dotenv
 from fastapi import Request
 from datetime import datetime
@@ -386,6 +387,74 @@ def test_update_kwargs_with_deployment(model_list):
     )
     set_fields = ["deployment", "api_base", "model_info"]
     assert all(field in kwargs["metadata"] for field in set_fields)
+
+
+@pytest.mark.parametrize("configured_service_tier", ["default", "flex", "priority"])
+def test_update_kwargs_with_deployment_enforces_configured_service_tier(
+    model_list, configured_service_tier
+):
+    router: Final = Router(model_list=model_list)
+    deployment: Final = router.get_deployment_by_model_group_name(
+        model_group_name="gpt-5-mini"
+    )
+    deployment["litellm_params"]["service_tier"] = configured_service_tier
+    kwargs: Final[dict] = {"metadata": {}, "service_tier": "auto"}
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert kwargs["service_tier"] == configured_service_tier
+
+
+def test_update_kwargs_with_deployment_preserves_request_service_tier_when_unconfigured(
+    model_list,
+):
+    router: Final = Router(model_list=model_list)
+    deployment: Final = router.get_deployment_by_model_group_name(
+        model_group_name="gpt-5-mini"
+    )
+    kwargs: Final[dict] = {"metadata": {}, "service_tier": "flex"}
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert kwargs["service_tier"] == "flex"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_service_tier", ["default", "flex", "priority"])
+async def test_prompt_management_factory_enforces_configured_service_tier(
+    configured_service_tier: str,
+) -> None:
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "managed-prompt",
+                "litellm_params": {
+                    "model": "langfuse/managed-prompt",
+                    "prompt_id": "managed-prompt",
+                    "service_tier": configured_service_tier,
+                },
+            }
+        ]
+    )
+    logging_object: Final = MagicMock()
+    messages: Final = [{"role": "user", "content": "Hello"}]
+    logging_object.get_chat_completion_prompt.return_value = (
+        "openai/gpt-5-mini",
+        messages,
+        {"service_tier": "auto"},
+    )
+
+    with patch("litellm.acompletion", new_callable=AsyncMock) as mock_acompletion:
+        await router._prompt_management_factory(
+            model="managed-prompt",
+            messages=messages,
+            kwargs={
+                "litellm_logging_obj": logging_object,
+                "original_function": "acompletion",
+            },
+        )
+
+    assert mock_acompletion.await_args.kwargs["service_tier"] == configured_service_tier
 
 
 def test_update_kwargs_with_default_litellm_params(model_list):
