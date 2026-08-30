@@ -5,6 +5,7 @@ Tests the rule-based complexity scoring and tier assignment logic.
 """
 
 import asyncio
+import json
 import logging
 from typing import Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2629,6 +2630,54 @@ class TestRouterPreRoutingSharedAliasName:
 
         assert sent["aws_region_name"] == "us-west-2"
         assert sent["drop_params"] is True
+
+    @pytest.mark.asyncio
+    async def test_complexity_tier_service_tier_beats_the_tier_deployments_own_service_tier(self):
+        marker = self._region_marker_entry()
+        marker["litellm_params"]["complexity_router_config"] = {
+            "tiers": {
+                tier: {"model_name": "bedrock-tier", "litellm_params": {"service_tier": "priority"}}
+                for tier in ("SIMPLE", "MEDIUM", "COMPLEX", "REASONING")
+            }
+        }
+        deployment = self._bedrock_tier_entry()
+        deployment["litellm_params"]["service_tier"] = "default"
+        router = Router(model_list=[marker, deployment])
+
+        sent = await self._routed_call_kwargs(router)
+
+        assert sent["service_tier"] == "priority"
+        assert "_pre_routing_litellm_param_keys" not in sent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pass_through", [False, True])
+    async def test_async_selectors_keep_pre_routing_state_out_of_request_kwargs(self, pass_through):
+        marker = self._region_marker_entry()
+        marker["litellm_params"]["complexity_router_config"] = {
+            "tiers": {
+                tier: {"model_name": "bedrock-tier", "litellm_params": {"service_tier": "priority"}}
+                for tier in ("SIMPLE", "MEDIUM", "COMPLEX", "REASONING")
+            }
+        }
+        deployment = self._bedrock_tier_entry()
+        deployment["litellm_params"]["service_tier"] = "default"
+        deployment["litellm_params"]["use_in_pass_through"] = True
+        router = Router(model_list=[marker, deployment])
+        request_kwargs = {"metadata": {}}
+
+        selector = (
+            router.async_get_available_deployment_for_pass_through
+            if pass_through
+            else router.async_get_available_deployment
+        )
+        selected = await selector(
+            model="smart-router", request_kwargs=request_kwargs, messages=[{"role": "user", "content": "hi"}]
+        )
+
+        json.dumps(request_kwargs)
+        assert "_pre_routing_litellm_param_keys" not in request_kwargs
+        router._update_kwargs_with_deployment(deployment=selected, kwargs=request_kwargs)
+        assert request_kwargs["service_tier"] == "priority"
 
     @pytest.mark.asyncio
     async def test_a_markers_explicit_flag_beats_the_tiers_pydantic_default(self):
