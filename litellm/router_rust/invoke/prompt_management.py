@@ -11,7 +11,7 @@ from typing import Final
 
 from litellm.litellm_core_utils.core_helpers import without
 from litellm.router_rust.invoke.endpoints import PLANS, EndpointCore
-from litellm.router_rust.invoke.shaping import as_dict, update_kwargs_with_deployment
+from litellm.router_rust.invoke.shaping import as_dict, enforce_deployment_service_tier, update_kwargs_with_deployment
 
 _PROMPT_MANAGEMENT_PARAMS: Final = frozenset(
     {"bitbucket_config", "dotprompt_config", "prompt_id", "prompt_variables", "prompt_label", "prompt_version"}
@@ -104,6 +104,7 @@ async def prompt_management_acompletion(
     )
     filtered_data: Final = without(data, *_PROMPT_MANAGEMENT_PARAMS)
     final: Final[dict[str, object]] = {**filtered_data, **kwargs, **optional_params}  # pyright: ignore[reportUnknownVariableType]  # mutable-ok: the call's kwargs
+    enforce_deployment_service_tier(params, final)
     final["model"] = rendered_model
     final["messages"] = rendered_messages
     final["litellm_logging_obj"] = logging_obj

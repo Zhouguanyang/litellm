@@ -1122,6 +1122,10 @@ class PreRouter:
         surface: Final = _tier_ceiling_under_the_surface_name(accepted, responses_call=responses_call)
         _drop_client_carriers_a_tier_pin_supersedes(request_kwargs, surface)
         request_kwargs.update(surface)
+        if "service_tier" in surface:
+            from litellm.router_rust.invoke.shaping import set_pre_routing_service_tier
+
+            set_pre_routing_service_tier(request_kwargs)
 
 
 def as_dict(value: object) -> Mapping[str, object]:

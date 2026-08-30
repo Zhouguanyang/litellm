@@ -20,6 +20,8 @@ from litellm.constants import DEFAULT_AUTO_ROUTER_MAX_INPUT_CHARS, ROUTER_USAGE_
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.router_config import build_router_config
+from litellm.router_core import make_core
 from litellm.router_strategy.adaptive_router.hooks import AdaptiveRouterPostCallHook
 from litellm.types.litellm_params import RoutingStrategyName
 from litellm.types.router import AlertingConfig, Deployment, DeploymentTypedDict, LiteLLM_Params, ModelInfo
@@ -228,6 +230,54 @@ async def test_router_schedule_acompletion(model_list):
         priority=1,
     )
     assert response["choices"][0]["message"]["content"] == "I'm fine, thank you!"
+
+
+@pytest.mark.parametrize("configured_service_tier", ["default", "flex", "priority"])
+def test_update_kwargs_with_deployment_enforces_configured_service_tier(configured_service_tier: str) -> None:
+    from tests.unit.test_router.core.scripted_host import ScriptedHost, deployment
+
+    host: Final = ScriptedHost()
+    tier_timeouts: Final = {tier: index + 1.0 for index, tier in enumerate(("default", "flex", "priority", "auto"))}
+    router: Final = make_core(build_router_config({"model_list": [deployment(
+        "tiered", "tiered-id", service_tier=configured_service_tier, timeout_by_service_tier=tier_timeouts,
+    )]}), host)
+
+    router.completion(model="tiered", messages=[{"role": "user", "content": "hi"}], service_tier="auto")
+
+    assert host.calls[-1].kwargs["service_tier"] == configured_service_tier
+    assert host.calls[-1].kwargs["timeout"] == tier_timeouts[configured_service_tier]
+
+
+def test_update_kwargs_with_deployment_preserves_request_service_tier_when_unconfigured() -> None:
+    from tests.unit.test_router.core.scripted_host import ScriptedHost, deployment
+
+    host: Final = ScriptedHost()
+    router: Final = make_core(build_router_config({"model_list": [deployment("tiered", "tiered-id")]}), host)
+
+    router.completion(model="tiered", messages=[{"role": "user", "content": "hi"}], service_tier="flex")
+
+    assert host.calls[-1].kwargs["service_tier"] == "flex"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_service_tier", ["default", "flex", "priority"])
+async def test_prompt_management_factory_enforces_configured_service_tier(configured_service_tier: str) -> None:
+    from tests.unit.test_router.core.scripted_host import ScriptedHost, deployment
+
+    host: Final = ScriptedHost()
+    router: Final = make_core(build_router_config({"model_list": [deployment(
+        "managed-prompt", "prompt-id", model="langfuse/managed-prompt",
+        prompt_id="managed-prompt", service_tier=configured_service_tier,
+    )]}), host)
+    logging_object: Final = MagicMock()
+    messages: Final = [{"role": "user", "content": "hello"}]
+    logging_object.get_chat_completion_prompt.return_value = (
+        "openai/rendered", messages, {"service_tier": "auto"},
+    )
+
+    await router.acompletion(model="managed-prompt", messages=messages, litellm_logging_obj=logging_object)
+
+    assert host.calls[-1].kwargs["service_tier"] == configured_service_tier
 
 
 @pytest.mark.parametrize("sync_mode", [True, False])

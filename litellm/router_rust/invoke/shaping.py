@@ -9,6 +9,7 @@ the same precedence and the same oddities. Nothing here reads a Python router.
 
 import dataclasses
 from collections.abc import Mapping, MutableMapping, Sequence
+from contextvars import ContextVar
 from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -61,6 +62,9 @@ ROUTER_CLIENTS_TARGET: Final = "router_clients"
 _MAPPING: Final = TypeAdapter(Mapping[str, object])
 _FORWARDED_CREDENTIAL_ISOLATION_PROVIDERS: Final = frozenset({"chatgpt", "anthropic"})
 _ALIAS_MARKER_FORWARDED_PARAMS_KWARG: Final = "_alias_marker_forwarded_params"
+_PRE_ROUTING_SERVICE_TIER: Final[ContextVar[Mapping[str, object] | None]] = ContextVar(
+    "pre_routing_service_tier", default=None
+)
 # Generic handlers whose stream timeout is split from the request timeout.
 STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS: Final = frozenset({"anthropic_messages", "aresponses", "responses"})
 
@@ -398,6 +402,25 @@ def _clientside_deployment(
 # --- the deployment --------------------------------------------------------------------------
 
 
+def set_pre_routing_service_tier(request: Mapping[str, object] | None) -> None:
+    _PRE_ROUTING_SERVICE_TIER.set(request)
+
+
+def carry_pre_routing_service_tier(source: Mapping[str, object], target: Mapping[str, object]) -> None:
+    _PRE_ROUTING_SERVICE_TIER.set(target if _PRE_ROUTING_SERVICE_TIER.get() is source else None)
+
+
+def enforce_deployment_service_tier(
+    deployment_params: Mapping[str, object], kwargs: MutableMapping[str, object]
+) -> None:
+    routing_request: Final = _PRE_ROUTING_SERVICE_TIER.get()
+    _PRE_ROUTING_SERVICE_TIER.set(None)
+    kwargs.pop("_pre_routing_litellm_param_keys", None)
+    configured: Final = deployment_params.get("service_tier")
+    if configured is not None and routing_request is not kwargs:
+        kwargs["service_tier"] = configured  # rebind-ok: fill request-owned kwargs
+
+
 def update_kwargs_with_deployment(
     shaping: Shaping,
     deployment: Mapping[str, object],
@@ -417,6 +440,7 @@ def update_kwargs_with_deployment(
     kwargs.pop("daily_reset_time", None)
     defaults: Final = shaping.default_litellm_params
     merge_tools_from_deployment(deployment_params, kwargs, defaults)
+    enforce_deployment_service_tier(deployment_params, kwargs)
 
     model_info: Mapping[str, object] = as_dict(  # rebind-ok: rebound as the Python router rebinds it
         deployment.get("model_info")

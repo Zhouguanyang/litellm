@@ -3193,6 +3193,9 @@ class RustCore(
         instead of the step's ``model``, a custom strategy's deployment, or ``None``. ``pass_through``
         is ``_async_get_available_deployment_for_pass_through``, which runs the hook whatever the
         router's strategy and which no replaced pick answers."""
+        from litellm.router_rust.invoke.shaping import set_pre_routing_service_tier
+
+        set_pre_routing_service_tier(None)
         assigned: Final[object] = None if pass_through else self.__dict__.get("_core_async_get_available_deployment")
         if callable(assigned):
             # The async pick assigned through the deprecated attribute answers, as Python's
@@ -3278,6 +3281,9 @@ class RustCore(
         specific_deployment: object = _NO_INPUT,
     ) -> object:
         """A custom strategy's sync pick (``get_available_deployment``); without one, no pre-routing."""
+        from litellm.router_rust.invoke.shaping import set_pre_routing_service_tier
+
+        set_pre_routing_service_tier(None)
         custom: Final = self._custom_strategy
         if custom is None:
             return None
@@ -4938,10 +4944,14 @@ class _Driver:
         level: Final = step.get("fallback_level")
         # The request params the walk's dict targets merged in (`kwargs.update(target)`).
         params: Final = as_str_mapping(step.get("params"))
+        from litellm.router_rust.invoke.shaping import carry_pre_routing_service_tier
+
+        attempt_request: Final = self._request if params is None else {**self._request, **params}
+        carry_pre_routing_service_tier(self._request, attempt_request)
         call: Final = attempt_call(
             self._core._port,  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
             self._plan,
-            self._request if params is None else {**self._request, **params},
+            attempt_request,
             deployment,
             group=requested,
             requested=requested,
