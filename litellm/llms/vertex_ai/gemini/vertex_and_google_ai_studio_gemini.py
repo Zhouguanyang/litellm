@@ -2115,7 +2115,7 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         Check if prompt is blocked due to content filtering at the prompt level.
 
         This handles the case where Vertex AI blocks the prompt before generation begins,
-        indicated by promptFeedback.blockReason being present.
+        indicated by a non-empty promptFeedback.blockReason.
 
         Args:
             processed_chunk: The parsed response chunk from Vertex AI
@@ -2133,7 +2133,7 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
 
         # Check if prompt is blocked due to content filtering
         prompt_feedback: Final = processed_chunk.get("promptFeedback")
-        if prompt_feedback and "blockReason" in prompt_feedback:
+        if prompt_feedback and prompt_feedback.get("blockReason"):
             verbose_logger.debug(
                 "Prompt blocked due to: %s - %s",
                 prompt_feedback.get("blockReason"),
@@ -2646,7 +2646,8 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         model_response.model = served if served is not None else model
 
         ## CHECK IF RESPONSE FLAGGED
-        if "promptFeedback" in completion_response and "blockReason" in completion_response["promptFeedback"]:
+        prompt_feedback: Final = completion_response.get("promptFeedback")
+        if prompt_feedback and prompt_feedback.get("blockReason"):
             return self._handle_blocked_response(
                 model_response=model_response,
                 completion_response=completion_response,

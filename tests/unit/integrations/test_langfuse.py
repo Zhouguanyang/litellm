@@ -5,6 +5,7 @@ import threading
 import time
 import types
 import unittest
+from collections.abc import Mapping
 from typing import Final
 from unittest.mock import MagicMock, Mock, patch
 
@@ -20,6 +21,11 @@ from litellm.integrations.langfuse.langfuse_otel import LangfuseOtelLogger
 from litellm.integrations.langfuse.langfuse_sdk import resolve_trace_id
 from litellm.integrations.opentelemetry import OpenTelemetryConfig
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.responses.utils import ResponseAPILoggingUtils
+
+# Import LangfuseUsageDetails directly from the module where it's defined
+from litellm.types.integrations.langfuse import *
+from litellm.types.llms.openai import InputTokensDetails, ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.services import ServiceLoggerPayload, ServiceTypes
 from litellm.types.utils import (
     Choices,
@@ -32,11 +38,6 @@ from litellm.types.utils import (
     TextChoices,
     TextCompletionResponse,
 )
-
-# Import LangfuseUsageDetails directly from the module where it's defined
-from litellm.types.integrations.langfuse import *
-from litellm.responses.utils import ResponseAPILoggingUtils
-from litellm.types.llms.openai import InputTokensDetails, ResponseAPIUsage, ResponsesAPIResponse
 
 
 @pytest.mark.asyncio
@@ -1630,6 +1631,260 @@ def _exported_span(logger, exporter):
     return exporter.get_finished_spans()[-1]
 
 
+@pytest.mark.parametrize(
+    "call_type", ["generate_content", "agenerate_content", "generate_content_stream", "agenerate_content_stream"]
+)
+@pytest.mark.parametrize(
+    "last_part",
+    [
+        {"text": "current user turn"},
+        {"functionResponse": {"name": "lookup", "response": {"result": "tool result"}}},
+        {"inlineData": {"mimeType": "image/png", "data": "eA=="}},
+    ],
+)
+def test_langfuse_records_complete_native_google_input_instead_of_the_last_user_text(
+    call_type: str, last_part: Mapping[str, object]
+) -> None:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    contents: Final = [
+        {"role": "user", "parts": [{"text": "earlier user turn"}]},
+        {"role": "model", "parts": [{"text": "earlier assistant turn"}]},
+        {"role": "user", "parts": [last_part]},
+    ]
+    native_input: Final = {
+        "contents": contents,
+        "systemInstruction": {"parts": [{"text": "system context"}, {"text": "more system context"}]},
+        "tools": [{"functionDeclarations": [{"name": "lookup"}]}],
+        "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+        "cachedContent": "cachedContents/example",
+        "continuationToken": "opaque-context-token",
+    }
+    request_body: Final = {**native_input, "model": "example-model", "generationConfig": {"temperature": 0.5}}
+    started: Final = datetime.datetime(2026, 1, 15, 12, 0, 0)
+    logging_obj: Final = Logging(
+        model="example-model",
+        messages="default-message-value",
+        stream="stream" in call_type,
+        call_type=call_type,
+        start_time=started,
+        litellm_call_id="native-google-context",
+        function_id="native-google-context",
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"metadata": {}},
+        optional_params={"tools": [{"name": "stale-tool"}], "functions": [{"name": "stale-function"}]},
+    )
+    logging_obj.pre_call(
+        input=contents,
+        api_key="test-key",
+        additional_args={
+            "complete_input_dict": request_body,
+            "headers": {"authorization": "test-secret"},
+        },
+    )
+    logger, exporter = _steering_logger()
+
+    logger.log_event_on_langfuse(
+        kwargs=logging_obj.model_call_details,
+        response_obj=ModelResponse(choices=[{"message": {"role": "assistant", "content": "answer"}}]),
+        start_time=started,
+        end_time=started,
+    )
+
+    span: Final = _exported_span(logger, exporter)
+    assert json.loads(span.attributes["langfuse.observation.input"]) == native_input
+    if "inlineData" in last_part:
+        assert json.loads(span.attributes["langfuse.trace.input"]) == native_input
+    assert request_body["contents"] == contents
+
+
+@pytest.mark.parametrize("redaction", ["global", "dynamic", "pre-redacted", "mask_input", "masking_function"])
+def test_native_google_langfuse_input_obeys_redaction_and_masking(
+    monkeypatch: pytest.MonkeyPatch, redaction: str
+) -> None:
+    from litellm.litellm_core_utils.redact_messages import perform_redaction, redact_message_input_output_from_logging
+
+    def mask_input(value: object) -> object:
+        return value.replace("private context", "masked context") if isinstance(value, str) else value
+
+    metadata: Final = {"mask_input": True} if redaction == "mask_input" else {}
+    params: Final = {
+        "metadata": metadata,
+        **({"_langfuse_masking_function": mask_input} if redaction == "masking_function" else {}),
+    }
+    native_input: Final = {"contents": [{"role": "user", "parts": [{"text": "private context"}]}]}
+    kwargs: Final = {
+        "call_type": "agenerate_content_stream",
+        "model": "example-model",
+        "litellm_params": params,
+        "messages": [{"role": "user", "content": "last user turn"}],
+        "input": native_input,
+        "optional_params": {},
+        "additional_args": {"complete_input_dict": native_input},
+        "standard_callback_dynamic_params": {"turn_off_message_logging": True} if redaction == "dynamic" else {},
+    }
+    monkeypatch.setattr(litellm, "turn_off_message_logging", redaction == "global")
+    response: Final = (
+        perform_redaction(kwargs, ModelResponse())
+        if redaction == "pre-redacted"
+        else redact_message_input_output_from_logging(kwargs, ModelResponse())
+    )
+    logger, exporter = _steering_logger()
+    started: Final = datetime.datetime(2026, 1, 15, 12, 0, 0)
+
+    logger.log_event_on_langfuse(kwargs=kwargs, response_obj=response, start_time=started, end_time=started)
+
+    span: Final = _exported_span(logger, exporter)
+    expected: Final = {
+        "global": json.dumps({"messages": [{"role": "user", "content": "redacted-by-litellm"}]}),
+        "dynamic": json.dumps({"messages": [{"role": "user", "content": "redacted-by-litellm"}]}),
+        "pre-redacted": json.dumps({"messages": [{"role": "user", "content": "redacted-by-litellm"}]}),
+        "mask_input": "redacted-by-litellm",
+        "masking_function": json.dumps({"contents": [{"role": "user", "parts": [{"text": "masked context"}]}]}),
+    }[redaction]
+    assert span.attributes["langfuse.observation.input"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("field", ["messages", "input", "both"])
+@pytest.mark.parametrize("in_place", [False, True])
+async def test_native_google_logging_hooks_mask_the_exported_input_without_changing_the_provider_request(
+    monkeypatch: pytest.MonkeyPatch, asynchronous: bool, field: str, in_place: bool
+) -> None:
+    from litellm.integrations.custom_logger import CustomLogger
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    original: Final = "private native history"
+    masked: Final = "masked history"
+    native_input: Final = {"contents": [{"role": "user", "parts": [{"text": original}]}]}
+    logger, exporter = _steering_logger()
+    started: Final = datetime.datetime(2026, 1, 15, 12, 0, 0)
+
+    class MaskingLogger(CustomLogger):
+        def _mask(self, value: object) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if item == original:
+                        value[key] = masked  # rebind-ok: in-place hook regression deliberately rewrites nested text
+                    else:
+                        self._mask(item)
+            elif isinstance(value, list):
+                for item in value:
+                    self._mask(item)
+
+        def logging_hook(
+            self, kwargs: dict[str, object], result: object, call_type: str
+        ) -> tuple[dict[str, object], object]:
+            assert kwargs["input"] == native_input
+            if in_place:
+                if field in ("messages", "both"):
+                    self._mask(kwargs["messages"])
+                if field in ("input", "both"):
+                    self._mask(kwargs["input"])
+                return kwargs, result
+            return {
+                **kwargs,
+                **({"messages": [{"role": "user", "content": masked}]} if field in ("messages", "both") else {}),
+                **(
+                    {"input": {"contents": [{"role": "user", "parts": [{"text": masked}]}]}}
+                    if field in ("input", "both")
+                    else {}
+                ),
+            }, result
+
+        async def async_logging_hook(
+            self, kwargs: dict[str, object], result: object, call_type: str
+        ) -> tuple[dict[str, object], object]:
+            return self.logging_hook(kwargs, result, call_type)
+
+    class LangfuseCallback(CustomLogger):
+        def log_success_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            logger.log_event_on_langfuse(kwargs=kwargs, response_obj=response_obj, start_time=started, end_time=started)
+
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            self.log_success_event(kwargs, response_obj, start_time, end_time)
+
+    callbacks: Final = [MaskingLogger(), LangfuseCallback()]
+    monkeypatch.setattr(litellm, "success_callback", [])
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    logging_obj: Final = Logging(
+        model="example-model",
+        messages=[{"role": "user", "content": original}],
+        stream=False,
+        call_type="agenerate_content" if asynchronous else "generate_content",
+        start_time=started,
+        litellm_call_id="native-masking",
+        function_id="native-masking",
+        dynamic_success_callbacks=[] if asynchronous else callbacks,
+        dynamic_async_success_callbacks=callbacks if asynchronous else [],
+    )
+    logging_obj.update_environment_variables(litellm_params={"metadata": {}}, optional_params={})
+    logging_obj.pre_call(
+        input=native_input["contents"], api_key="", additional_args={"complete_input_dict": native_input}
+    )
+    response: Final = ModelResponse(choices=[{"message": {"role": "assistant", "content": "answer"}}])
+    logging_obj.model_call_details["httpx_response"] = httpx.Response(
+        200,
+        json={
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "answer"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+        },
+    )
+    if asynchronous:
+        await logging_obj.async_success_handler(response, started, started)
+    else:
+        logging_obj.success_handler(response, started, started)
+
+    span: Final = _exported_span(logger, exporter)
+    logged: Final = span.attributes["langfuse.observation.input"]
+    assert original not in logged
+    assert json.loads(logged) == (
+        {"messages": [{"role": "user", "content": masked}]}
+        if field == "messages"
+        else {"contents": [{"role": "user", "parts": [{"text": masked}]}]}
+    )
+    assert native_input == {"contents": [{"role": "user", "parts": [{"text": original}]}]}
+
+
+@pytest.mark.parametrize(
+    "call_type,additional_args",
+    [
+        ("completion", {"complete_input_dict": {"contents": [{"parts": [{"text": "unrelated content"}]}]}}),
+        ("agenerate_content_stream", {}),
+        ("agenerate_content_stream", {"complete_input_dict": "not-an-object"}),
+        ("agenerate_content_stream", {"complete_input_dict": {"tools": []}}),
+    ],
+)
+def test_langfuse_keeps_existing_input_when_native_google_request_is_unavailable(
+    call_type: str, additional_args: Mapping[str, object]
+) -> None:
+    messages: Final = [{"role": "user", "content": "existing input"}]
+    logger, exporter = _steering_logger()
+    started: Final = datetime.datetime(2026, 1, 15, 12, 0, 0)
+
+    logger.log_event_on_langfuse(
+        kwargs={
+            "call_type": call_type,
+            "messages": messages,
+            "additional_args": additional_args,
+            "optional_params": {},
+            "litellm_params": {"metadata": {}},
+        },
+        response_obj=ModelResponse(),
+        start_time=started,
+        end_time=started,
+    )
+
+    span: Final = _exported_span(logger, exporter)
+    assert json.loads(span.attributes["langfuse.observation.input"]) == {"messages": messages}
+
+
 _TRACE_FIELD_KEYS = {
     "user.id": "user_id",
     "session.id": "session_id",
@@ -2921,9 +3176,7 @@ def test_langfuse_logging_without_request_response(monkeypatch: pytest.MonkeyPat
             "messages": [{"role": "user", "content": _LANGFUSE_REDACTED}],
             "optional_params": {},
         },
-        response_obj=litellm.ModelResponse(
-            choices=[{"message": {"role": "assistant", "content": _LANGFUSE_REDACTED}}]
-        ),
+        response_obj=litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": _LANGFUSE_REDACTED}}]),
     )
     span = _exported_span(logger, exporter)
 
