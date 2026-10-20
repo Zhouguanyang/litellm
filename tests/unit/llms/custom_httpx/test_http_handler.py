@@ -135,6 +135,42 @@ def test_sync_post_streaming_status_error_should_not_wait_forever_for_body(
         litellm_handler.close()
 
 
+def test_closing_sync_handler_keeps_the_configured_transport_open_for_other_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Transport(httpx.MockTransport):
+        closed: bool = False
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            if self.closed:
+                raise RuntimeError("shared transport has been closed")
+            return super().handle_request(request)
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    transport: Final = Transport(lambda _: httpx.Response(200, text="answer"))
+    monkeypatch.setattr(litellm, "force_ipv4", False)
+    monkeypatch.setattr(litellm, "sync_transport", transport, raising=False)
+    retired: Final = HTTPHandler()
+    shared: Final = HTTPHandler()
+    client: Final = retired.client
+
+    try:
+        assert shared.get("https://provider.example/completions").text == "answer"
+        retired.close()
+
+        assert client.is_closed
+        assert shared.get("https://provider.example/completions").text == "answer"
+        shared.close()
+        assert not transport.closed
+    finally:
+        retired.close()
+        shared.close()
+        transport.close()
+
+
 @pytest.mark.asyncio
 async def test_ssl_security_level(monkeypatch):
     # Ensure aiohttp transport is enabled for this test

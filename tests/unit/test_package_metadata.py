@@ -76,6 +76,20 @@ def test_cli_extra_is_a_thin_client_install() -> None:
     assert cli & PROXY_SERVER_ONLY_DEPENDENCIES == frozenset()
 
 
+def test_sdk_dependencies_exclude_backoff_without_media_retry_support() -> None:
+    declared: Final = tuple(Requirement(value) for value in PYPROJECT["project"]["dependencies"])
+    active: Final = tuple(
+        requirement
+        for requirement in declared
+        if canonicalize_name(requirement.name) == "backoff"
+        and (requirement.marker is None or requirement.marker.evaluate({"extra": ""}))
+    )
+    assert active, "SDK media uploads require backoff without installing proxy extras"
+    assert all(not requirement.specifier.contains("1.11.1") for requirement in active), (
+        "backoff 1.x lacks runtime, https://backoff.readthedocs.io/en/latest/changelog.html, checked 2026-10-19"
+    )
+
+
 def test_declared_aiohttp_floor_excludes_pool_poisoning_releases() -> None:
     declared: Final = tuple(
         Requirement(requirement)

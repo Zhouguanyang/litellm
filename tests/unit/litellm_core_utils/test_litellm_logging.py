@@ -86,6 +86,47 @@ def logging_obj():
 
 
 @pytest.mark.asyncio
+async def test_native_google_stream_keeps_logging_hook_masking_when_the_hook_then_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    masked: Final = [{"role": "user", "content": "masked"}]
+    logged: Final[list[object]] = []
+
+    class MaskingLogger(CustomLogger):
+        async def async_logging_hook(
+            self, kwargs: dict[str, object], result: object, call_type: str
+        ) -> tuple[dict[str, object], object]:
+            kwargs["messages"] = masked  # rebind-ok: the regression requires a hook that mutates before raising
+            raise RuntimeError("masking hook failed after editing messages")
+
+        async def async_log_success_event(
+            self, kwargs: Mapping[str, object], response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            logged.append(kwargs.get("input"))
+
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    started: Final = datetime.datetime(2026, 1, 15, 12, 0, 0)
+    logger: Final = Logging(
+        model="example-model",
+        messages=[{"role": "user", "content": "private"}],
+        stream=True,
+        call_type="agenerate_content_stream",
+        start_time=started,
+        litellm_call_id="native-google-failed-hook",
+        function_id="native-google-failed-hook",
+        dynamic_async_success_callbacks=[MaskingLogger()],
+    )
+    logger.update_environment_variables(litellm_params={"metadata": {}}, optional_params={})
+    logger.pre_call(
+        input=[], api_key="", additional_args={"complete_input_dict": {"contents": [{"parts": [{"text": "private"}]}]}}
+    )
+
+    await logger.async_success_handler(ModelResponse(), started, started)
+
+    assert logged == [masked]
+
+
+@pytest.mark.asyncio
 async def test_async_post_mcp_tool_call_hook_preserves_and_returns_content(logging_obj):
     from litellm.types.mcp import MCPPostCallResponseObject
 

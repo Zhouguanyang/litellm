@@ -104,6 +104,10 @@ from litellm.litellm_core_utils.logging_utils import (
     truncate_base64_in_messages_async,
 )
 from litellm.litellm_core_utils.model_param_helper import ModelParamHelper
+from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    GOOGLE_GENERATE_CONTENT_CALL_TYPES,
+    google_generate_content_logging_input,
+)
 from litellm.litellm_core_utils.ptu_pricing import is_spilled_over_ptu_request
 from litellm.litellm_core_utils.redact_messages import (
     redact_message_input_output_from_custom_logger,
@@ -1413,7 +1417,11 @@ class Logging(LiteLLMLoggingBaseClass):
         Common helper function across the sync + async pre-call function
         """
 
-        self.model_call_details["input"] = input
+        logging_args: Final = _LITELLM_PARAMS.validate_python(additional_args)
+        native_input: Final = google_generate_content_logging_input(
+            self._model_call_details_view.get("call_type"), logging_args.get("complete_input_dict")
+        )
+        self.model_call_details["input"] = copy.deepcopy(native_input) if native_input is not None else input
         self.model_call_details["api_key"] = api_key
         self.model_call_details["additional_args"] = additional_args
         self.model_call_details["log_event_type"] = "pre_api_call"
@@ -1430,6 +1438,22 @@ class Logging(LiteLLMLoggingBaseClass):
         self.model_call_details["litellm_params"]["api_base"] = self._get_masked_api_base(
             additional_args.get("api_base", "")
         )
+
+    def _native_logging_hook_snapshot(self, details: Mapping[str, object]) -> tuple[object, object]:
+        if details.get("call_type") not in GOOGLE_GENERATE_CONTENT_CALL_TYPES:
+            return None, None
+        return copy.deepcopy(details.get("messages")), copy.deepcopy(details.get("input"))
+
+    def _masked_native_logging_input(
+        self, details: Mapping[str, object], previous_messages: object, previous_input: object
+    ) -> Mapping[str, object] | None:
+        if (
+            details.get("call_type") in GOOGLE_GENERATE_CONTENT_CALL_TYPES
+            and details.get("messages") != previous_messages
+            and details.get("input") == previous_input
+        ):
+            return {**details, "input": details.get("messages")}
+        return None
 
     def pre_call(self, input, api_key, model=None, additional_args={}):
         # Log the exact input to the LLM API
@@ -3040,6 +3064,7 @@ class Logging(LiteLLMLoggingBaseClass):
             )
             ## LOGGING HOOK ##
             for callback in callbacks:
+                previous_messages, previous_input = self._native_logging_hook_snapshot(call_details)
                 if isinstance(callback, CustomGuardrail):
                     from litellm.types.guardrails import GuardrailEventHooks
 
@@ -3064,6 +3089,10 @@ class Logging(LiteLLMLoggingBaseClass):
                         result=result,
                         call_type=self.call_type,
                     )
+                if (
+                    masked_details := self._masked_native_logging_input(call_details, previous_messages, previous_input)
+                ) is not None:
+                    call_details = dict(masked_details)
                 if not for_async_request:
                     self.model_call_details = call_details
 
@@ -3531,9 +3560,8 @@ class Logging(LiteLLMLoggingBaseClass):
                 if self.model_call_details.get("cache_hit", False) is True:
                     self.model_call_details["response_cost"] = 0.0
                 elif (
-                    (existing_response_cost := self.model_call_details.get("response_cost")) is None
-                    or existing_response_cost == 0
-                ):
+                    existing_response_cost := self.model_call_details.get("response_cost")
+                ) is None or existing_response_cost == 0:
                     # check if base_model set on azure
                     get_base_model_from_metadata(model_call_details=self.model_call_details)
                     # base_model defaults to None if not set on model_info
@@ -3609,6 +3637,7 @@ class Logging(LiteLLMLoggingBaseClass):
         ## LOGGING HOOK ##
 
         for callback in callbacks:
+            previous_messages, previous_input = self._native_logging_hook_snapshot(self.model_call_details)
             try:
                 if isinstance(callback, CustomGuardrail):
                     from litellm.types.guardrails import GuardrailEventHooks
@@ -3643,6 +3672,13 @@ class Logging(LiteLLMLoggingBaseClass):
                     traceback.format_exc(),
                 )
                 self._handle_callback_failure(callback=callback)
+
+            if (
+                masked_details := self._masked_native_logging_input(
+                    self.model_call_details, previous_messages, previous_input
+                )
+            ) is not None:
+                self.model_call_details = dict(masked_details)
 
         self.mark_logging_complete(event_type="async_success")
 

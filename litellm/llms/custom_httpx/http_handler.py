@@ -9,6 +9,7 @@ import threading
 import time
 import weakref
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from io import BytesIO
 from types import MappingProxyType
@@ -1404,6 +1405,17 @@ class AsyncHTTPHandler:
     _create_httpx_proxy_mounts = create_httpx_proxy_mounts
 
 
+@dataclass(frozen=True, slots=True)
+class _SharedSyncTransport(httpx.BaseTransport):
+    transport: httpx.BaseTransport
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self.transport.handle_request(request)
+
+    def close(self) -> None:
+        pass
+
+
 class HTTPHandler:
     def __init__(
         self,
@@ -1719,7 +1731,7 @@ class HTTPHandler:
         except Exception:
             pass
 
-    def _create_sync_transport(self) -> HTTPTransport | None:
+    def _create_sync_transport(self) -> httpx.BaseTransport | None:
         """
         Create an HTTP transport with IPv4 only if litellm.force_ipv4 is True.
         Otherwise, return None.
@@ -1729,7 +1741,8 @@ class HTTPHandler:
         if litellm.force_ipv4:
             return HTTPTransport(local_address=_IPV4_LOCAL_ADDRESS, http2=http2_enabled())
         else:
-            return getattr(litellm, "sync_transport", None)
+            transport: Final[httpx.BaseTransport | None] = getattr(litellm, "sync_transport", None)
+            return _SharedSyncTransport(transport) if transport is not None else None
 
     @staticmethod
     def _create_sync_proxy_mounts(
