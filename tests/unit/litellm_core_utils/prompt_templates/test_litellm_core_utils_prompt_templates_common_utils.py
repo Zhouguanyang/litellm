@@ -4,6 +4,7 @@ import functools
 import json
 import os
 import sys
+from collections.abc import Mapping
 from typing import Final, cast
 
 import pytest
@@ -13,6 +14,7 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
     TOOL_RESULT_IMAGE_BOUNDARY,
     TOOL_RESULT_IMAGE_PLACEHOLDER,
     add_system_prompt_to_messages,
+    base64_media_data_uri,
     cache_control_as_prompt_cache_breakpoint,
     converse_redacted_content,
     encrypted_content_from_signature,
@@ -21,8 +23,10 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_format_from_file_id,
     get_semantic_cache_prompt_from_messages,
     get_str_from_messages,
+    google_generate_content_input,
     handle_any_messages_to_chat_completion_str_messages_conversion,
     hoist_images_from_tool_messages,
+    image_response_data_uri,
     is_encrypted_reasoning_block,
     merge_consecutive_system_messages,
     native_redacted_thinking_data,
@@ -39,6 +43,78 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
 
 _ARTIFACT_FIELD_PATTERN: Final = r'^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$'
 _ARTIFACT_DATA_ID_PATTERN: Final = r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"
+
+
+@pytest.mark.parametrize("field", ["b64_json", "result"])
+def test_generated_image_data_uri_preserves_image_bytes_and_detects_the_content_type(field: str) -> None:
+    image: Final = b"RIFFxxxxWEBP" + b"image-bytes"
+    encoded: Final = base64.b64encode(image).decode()
+    part: Final = {"type": "image_generation_call", "result": encoded} if field == "result" else {"b64_json": encoded}
+
+    result: Final = image_response_data_uri(part)
+
+    assert result == (field, f"data:image/webp;base64,{encoded}")
+    assert base64.b64decode(result[1].split(",", 1)[1]) == image
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"b64_json": None},
+        {"b64_json": ""},
+        {"b64_json": "invalid-base64"},
+        {"b64_json": "测试"},
+        {"b64_json": base64.b64encode(b"ordinary text").decode()},
+        {"type": "function_call_output", "result": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()},
+    ],
+)
+def test_generated_image_data_uri_does_not_treat_other_results_as_images(part: Mapping[str, object]) -> None:
+    assert image_response_data_uri(part) is None
+
+
+@pytest.mark.parametrize(
+    "shape", ["data-uri", "anthropic", "vertex", "gemini-camel", "gemini-snake", "images", "responses"]
+)
+def test_base64_media_data_uri_preserves_the_payload_and_identifies_its_field(shape: str) -> None:
+    image: Final = b"\x89PNG\r\n\x1a\n" + b"image-bytes"
+    encoded: Final = base64.b64encode(image).decode()
+    data_uri: Final = f"data:image/png;base64,{encoded}"
+    value, path = {
+        "data-uri": (data_uri, ()),
+        "anthropic": ({"type": "base64", "media_type": "image/png", "data": encoded}, ("data",)),
+        "vertex": ({"type": "media", "mime_type": "image/png", "data": encoded}, ("data",)),
+        "gemini-camel": ({"inlineData": {"mimeType": "image/png", "data": encoded}}, ("inlineData", "data")),
+        "gemini-snake": ({"inline_data": {"mime_type": "image/png", "data": encoded}}, ("inline_data", "data")),
+        "images": ({"b64_json": encoded}, ("b64_json",)),
+        "responses": ({"type": "image_generation_call", "result": encoded}, ("result",)),
+    }[shape]
+
+    assert base64_media_data_uri(value) == (path, data_uri)
+
+
+def test_google_generate_content_input_keeps_context_and_excludes_transport_options() -> None:
+    context: Final = {
+        "contents": [{"role": "user", "parts": [{"text": "context"}]}],
+        "systemInstruction": {"parts": [{"text": "system"}]},
+        "tools": [{"functionDeclarations": [{"name": "lookup"}]}],
+        "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+        "cachedContent": "cachedContents/example",
+        "continuationToken": "opaque-context-token",
+    }
+    request: Final = {
+        **context,
+        "model": "example-model",
+        "generationConfig": {"temperature": 0.5},
+        "api_key": "test-secret",
+    }
+
+    assert google_generate_content_input(request) == context
+    assert request == {
+        **context,
+        "model": "example-model",
+        "generationConfig": {"temperature": 0.5},
+        "api_key": "test-secret",
+    }
 
 
 def test_get_format_from_file_id():
@@ -2325,7 +2401,9 @@ _CONVERSE_REDACTED_DATA: Final = base64.b64encode(_NATIVE_REDACTED_DATA.encode()
             encrypted_reasoning_signature("gAAAA_1"), encrypted_reasoning_signature("gAAAA_1"), id="openai-encrypted"
         ),
         pytest.param("", "", id="blank"),
-        pytest.param(base64.b64encode(b"not base64!").decode(), base64.b64encode(b"not base64!").decode(), id="b64-once"),
+        pytest.param(
+            base64.b64encode(b"not base64!").decode(), base64.b64encode(b"not base64!").decode(), id="b64-once"
+        ),
     ],
 )
 def test_native_redacted_thinking_data_only_unwraps_the_converse_base64_layer(data: str, native: str) -> None:

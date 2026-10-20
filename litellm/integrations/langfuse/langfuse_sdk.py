@@ -5,27 +5,38 @@ import os
 import re
 import threading
 from base64 import b64encode
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from functools import partial, reduce
 from hashlib import sha256
 from importlib.metadata import version
-from itertools import chain
+from itertools import chain, count
+from json import dumps
+from queue import Empty, Full, Queue
 from time import monotonic, sleep
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Final, Literal, ParamSpec, TypeVar
 from urllib.parse import quote
+from weakref import ref
 
+import backoff
 import httpx
 import opentelemetry.trace as otel_trace
 from langfuse import LangfuseOtelSpanAttributes
-from langfuse.api import LangfuseAPI, Prompt, Prompt_Chat
+from langfuse._utils.serializer import EventSerializer
+from langfuse.api import GetMediaUploadUrlResponse, LangfuseAPI, MediaContentType, Prompt, Prompt_Chat
+from langfuse.api.core import http_client as langfuse_http_client
 from langfuse.api.core.api_error import ApiError
 from langfuse.api.core.request_options import RequestOptions
+from langfuse.media import LangfuseMedia
 from langfuse.model import BasePromptClient, ChatPromptClient, PromptClient, TextPromptClient
-from opentelemetry.context import Context
+from opentelemetry import context as otel_context
+from opentelemetry.context import (
+    _SUPPRESS_INSTRUMENTATION_KEY,  # pyright: ignore[reportPrivateUsage]  # SDK exporter suppression key
+    Context,
+)
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, SpanLimits, TracerProvider
@@ -34,13 +45,14 @@ from opentelemetry.sdk.trace.id_generator import RandomIdGenerator
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON, Decision, Sampler, SamplingResult
 from opentelemetry.trace import Link, NonRecordingSpan, Span, SpanContext, SpanKind, TraceFlags, Tracer, TraceState
 from opentelemetry.util.types import Attributes, AttributeValue
-from pydantic import ConfigDict
+from pydantic import ConfigDict, JsonValue, TypeAdapter, ValidationError
 
 import litellm
 from litellm._logging import verbose_logger
 from litellm.integrations.langfuse.langfuse import PROMPT_CACHE_TTL_ENV, parse_langfuse_debug, whole_number
+from litellm.litellm_core_utils.prompt_templates.common_utils import base64_media_data_uri
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
-from litellm.llms.custom_httpx.http_handler import HTTPHandler, get_httpx_client
+from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from litellm.types.llms.base import LiteLLMBaseModel
 
 __all__ = (
@@ -60,6 +72,7 @@ __all__ = (
     "configured_release",
     "configured_sample_rate",
     "configured_timeout",
+    "contains_langfuse_media",
     "enable_langfuse_debug_logging",
     "flush_langfuse_tracing",
     "observation_attributes",
@@ -80,11 +93,22 @@ _LANGFUSE_INGESTION_VERSION: Final = "4"
 _NO_REST_RETRIES: Final = RequestOptions(max_retries=0)
 _TRUNCATION_MARKER: Final = "<truncated due to size exceeding limit>"
 _METADATA_PREFIXES: Final = (LangfuseOtelSpanAttributes.OBSERVATION_METADATA, LangfuseOtelSpanAttributes.TRACE_METADATA)
+_OUTPUT_PREFIXES: Final = (LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT, LangfuseOtelSpanAttributes.TRACE_OUTPUT)
 _TRUNCATION_GROUPS: Final = (
-    (LangfuseOtelSpanAttributes.OBSERVATION_INPUT, LangfuseOtelSpanAttributes.TRACE_INPUT),
-    (LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT, LangfuseOtelSpanAttributes.TRACE_OUTPUT),
+    _OUTPUT_PREFIXES,
     _METADATA_PREFIXES,
 )
+_MEDIA_FIELDS: Final = (
+    (LangfuseOtelSpanAttributes.OBSERVATION_INPUT, "input"),
+    (LangfuseOtelSpanAttributes.TRACE_INPUT, "input"),
+    (LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT, "output"),
+    (LangfuseOtelSpanAttributes.TRACE_OUTPUT, "output"),
+    (LangfuseOtelSpanAttributes.OBSERVATION_METADATA, "metadata"),
+    (LangfuseOtelSpanAttributes.TRACE_METADATA, "metadata"),
+)
+_MEDIA_JSON: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
+_MediaParams: Final = ParamSpec("_MediaParams")
+_MediaResult: Final = TypeVar("_MediaResult")
 _SERVER_FLOOR_HINT: Final = (
     "; the OTLP traces route needs a self-hosted Langfuse server on 3.63.0 or newer "
     "(https://langfuse.com/self-hosting/upgrade/versioning#sdk-server)"
@@ -95,6 +119,7 @@ _DEFAULT_FLUSH_AT: Final = 512
 _CHANNEL_RETIRE_GRACE_SECONDS: Final = 60.0
 _DEFAULT_TIMEOUT_SECONDS: Final = 20.0
 _DEFAULT_MAX_RETRIES: Final = 3
+_DEFAULT_MAX_EVENT_SIZE_BYTES: Final = 1_000_000
 _MAX_RETRIES: Final = 1_000
 _MAX_BACKOFF_EXPONENT: Final = 6
 _DEFAULT_PROMPT_CACHE_TTL_SECONDS: Final = 60.0
@@ -604,7 +629,9 @@ def _in_group(key: str, group: tuple[str, ...]) -> bool:
 
 def _group_size(attributes: Mapping[str, AttributeValue], group: tuple[str, ...]) -> int:
     return sum(
-        len(str(value)) for key, value in attributes.items() if _in_group(key, group) and value != _TRUNCATION_MARKER
+        len(str(value).encode("utf-8", errors="replace"))
+        for key, value in attributes.items()
+        if _in_group(key, group) and value != _TRUNCATION_MARKER
     )
 
 
@@ -613,11 +640,9 @@ def _marker_key(prefix: str) -> str:
     return f"{prefix}.truncated" if prefix in _METADATA_PREFIXES else prefix
 
 
-def _truncated(span: ReadableSpan) -> ReadableSpan | None:
-    """The span with its largest remaining input, output or metadata replaced by the marker the v2 consumer wrote
-    when an event went over ``LANGFUSE_MAX_EVENT_SIZE_BYTES``, or ``None`` once all three are gone."""
+def _truncated(span: ReadableSpan, groups: tuple[tuple[str, ...], ...] = _TRUNCATION_GROUPS) -> ReadableSpan | None:
     attributes: Final = span.attributes or MappingProxyType({})
-    largest: Final = max(_TRUNCATION_GROUPS, key=lambda group: _group_size(attributes, group))
+    largest: Final = max(groups, key=lambda group: _group_size(attributes, group))
     if _group_size(attributes, largest) == 0:
         return None
     kept: Final = {key: value for key, value in attributes.items() if not _in_group(key, largest)}
@@ -626,12 +651,16 @@ def _truncated(span: ReadableSpan) -> ReadableSpan | None:
         for prefix in largest
         if any(_in_group(key, (prefix,)) for key in attributes)
     }
+    return _with_attributes(span, MappingProxyType({**kept, **marked}))
+
+
+def _with_attributes(span: ReadableSpan, attributes: Mapping[str, AttributeValue]) -> ReadableSpan:
     return ReadableSpan(
         name=span.name,
         context=span.context,
         parent=span.parent,
         resource=span.resource,
-        attributes=MappingProxyType({**kept, **marked}),
+        attributes=attributes,
         events=span.events,
         links=span.links,
         kind=span.kind,
@@ -640,6 +669,339 @@ def _truncated(span: ReadableSpan) -> ReadableSpan | None:
         end_time=span.end_time,
         instrumentation_scope=span.instrumentation_scope,
     )
+
+
+def _limited_span(span: ReadableSpan, max_bytes: int) -> ReadableSpan:
+    attributes: Final = span.attributes or MappingProxyType({})
+    oversized: Final = tuple(prefix for prefix in _OUTPUT_PREFIXES if _group_size(attributes, (prefix,)) > max_bytes)
+    if not oversized:
+        return span
+    verbose_logger.warning(
+        "Langfuse output exceeds LANGFUSE_MAX_EVENT_SIZE_BYTES=%d, replacing it with %r",
+        max_bytes,
+        _TRUNCATION_MARKER,
+    )
+    return _truncated(span, (oversized,)) or span
+
+
+def _media_data(value: str) -> JsonValue:
+    try:
+        return _MEDIA_JSON.validate_json(value)
+    except ValidationError:
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaEndpoints:
+    get_upload_url: partial[GetMediaUploadUrlResponse]
+    patch: partial[None]
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaApi:
+    media: _MediaEndpoints
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaStorageClient:
+    client: httpx.Client
+    timeout: float
+
+    def put(self, url: str, *, headers: Mapping[str, str], content: bytes) -> httpx.Response:
+        return self.client.put(url, headers=headers, content=content, timeout=self.timeout)
+
+
+class _MediaContent(LiteLLMBaseModel):
+    model_config = ConfigDict(frozen=True, from_attributes=True, alias_generator=lambda key: "_" + key)
+
+    content_bytes: bytes
+    content_length: int
+    content_type: MediaContentType
+    content_sha256_hash: str
+
+
+def _media_error_response(error: Exception) -> httpx.Response | None:
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response
+    if isinstance(error, ApiError) and error.status_code is not None:
+        return httpx.Response(error.status_code, headers=httpx.Headers(error.headers, encoding="utf-8"))
+    return None
+
+
+def _media_retry_giveup(error: Exception) -> bool:
+    response: Final = _media_error_response(error)
+    return response is not None and response.status_code < 500 and response.status_code not in (408, 409, 429)
+
+
+@dataclass(frozen=True, slots=True)
+class _RetryingMediaManager:
+    api: _MediaApi
+    storage: _MediaStorageClient
+    max_attempts: int
+
+    def upload(self, *, media: LangfuseMedia, trace_id: str, observation_id: str | None, field: str) -> None:
+        content: Final = _MediaContent.model_validate(media)
+        registration: Final = self._request_with_backoff(
+            self.api.media.get_upload_url,
+            content_length=content.content_length,
+            content_type=content.content_type,
+            sha256hash=content.content_sha256_hash,
+            trace_id=trace_id,
+            observation_id=observation_id,
+            field=field,
+        )
+        upload_url: Final = registration.upload_url
+        if upload_url is not None:
+            headers: Final = {
+                "Content-Type": content.content_type,
+                **(
+                    {}
+                    if "storage.googleapis.com" in upload_url
+                    else {"x-ms-blob-type": "BlockBlob", "x-amz-checksum-sha256": content.content_sha256_hash}
+                ),
+            }
+
+            def upload() -> httpx.Response:
+                return self.storage.put(upload_url, headers=headers, content=content.content_bytes).raise_for_status()
+
+            started: Final = monotonic()
+            response: Final = self._upload_response(upload)
+            self._request_with_backoff(
+                self.api.media.patch,
+                media_id=registration.media_id,
+                uploaded_at=datetime.now(timezone.utc),
+                upload_http_status=response.status_code,
+                upload_http_error=response.text,
+                upload_time_ms=int((monotonic() - started) * 1000),
+            )
+            response.raise_for_status()
+        media._media_id = registration.media_id  # pyright: ignore[reportPrivateUsage]  # rebind-ok: SDK reference ID
+
+    def _upload_response(self, upload: Callable[[], httpx.Response]) -> httpx.Response:
+        try:
+            return self._request_with_backoff(upload)
+        except httpx.HTTPStatusError as error:
+            return error.response
+
+    def _request_with_backoff(
+        self,
+        func: Callable[_MediaParams, _MediaResult],
+        *args: _MediaParams.args,
+        **kwargs: _MediaParams.kwargs,  # kwargs-ok: SDK retry hook forwards calls with a ParamSpec-preserved contract
+    ) -> _MediaResult:
+        attempts: Final = count()
+
+        def delay(error: Exception) -> float:
+            response: Final = _media_error_response(error) or httpx.Response(500)
+            return langfuse_http_client._retry_timeout(  # pyright: ignore[reportPrivateUsage]  # SDK owns wait policy
+                response=response, retries=next(attempts)
+            )
+
+        retry: Final = backoff.on_exception(
+            backoff.runtime,
+            Exception,
+            max_tries=self.max_attempts,
+            giveup=_media_retry_giveup,
+            value=delay,
+            jitter=None,
+            logger=None,
+        )
+        return retry(partial(func, *args, **kwargs))()
+
+
+def _media_candidate(data: JsonValue) -> tuple[tuple[str, ...], str] | None:
+    candidate: Final = base64_media_data_uri(data)
+    if candidate is None or candidate[1].startswith("@@@langfuseMedia:", candidate[1].find(",") + 1):
+        return None
+    return candidate
+
+
+def _contains_media(data: JsonValue, depth: int = 0) -> bool:
+    if depth > 20:
+        return False
+    if _media_candidate(data) is not None:
+        return True
+    if isinstance(data, list):
+        return any(_contains_media(item, depth + 1) for item in data)
+    if isinstance(data, dict):
+        return any(_contains_media(item, depth + 1) for item in data.values())
+    return False
+
+
+def contains_langfuse_media(value: object) -> bool:
+    serialized: Final = _serialize(value)
+    return serialized is not None and _contains_media(_media_data(serialized))
+
+
+def _with_media_reference(data: JsonValue, path: tuple[str, ...], reference: str) -> JsonValue:
+    if not path:
+        return reference
+    if not isinstance(data, dict):
+        return data
+    return {
+        key: _with_media_reference(value, path[1:], reference) if key == path[0] else value
+        for key, value in data.items()
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaUploads:
+    manager: _RetryingMediaManager
+    enabled: bool = field(
+        default_factory=lambda: os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED", "True").lower() not in ("false", "0")
+    )
+
+    def has_media(self, span: ReadableSpan) -> bool:
+        return self.enabled and any(
+            isinstance(value, str) and _contains_media(_media_data(value))
+            for key, value in (span.attributes or {}).items()
+            if any(_in_group(key, (prefix,)) for prefix, _ in _MEDIA_FIELDS)
+        )
+
+    def process(self, span: ReadableSpan) -> ReadableSpan:
+        context: Final = span.context
+        if context is None or not context.is_valid:
+            return span
+        attributes: Final = MappingProxyType(
+            {key: self._attribute(key, value, context) for key, value in (span.attributes or {}).items()}
+        )
+        return _with_attributes(span, attributes)
+
+    def _attribute(self, key: str, value: AttributeValue, context: SpanContext) -> AttributeValue:
+        field_name: Final = next((field for prefix, field in _MEDIA_FIELDS if _in_group(key, (prefix,))), None)
+        if field_name is None or not isinstance(value, str):
+            return value
+        data: Final = _media_data(value)
+        processed: Final = self._value(data, context, field_name, key)
+        return value if processed == data else dumps(processed)
+
+    def _value(self, data: JsonValue, context: SpanContext, field_name: str, key: str, depth: int = 0) -> JsonValue:
+        if depth > 20:
+            return data
+        candidate: Final = _media_candidate(data)
+        if candidate is None:
+            if isinstance(data, list):
+                return [self._value(item, context, field_name, key, depth + 1) for item in data]
+            if isinstance(data, dict):
+                return {name: self._value(item, context, field_name, key, depth + 1) for name, item in data.items()}
+            return data
+        try:
+            media: Final = LangfuseMedia(base64_data_uri=candidate[1])
+            self.manager.upload(
+                media=media,
+                trace_id=format(context.trace_id, "032x"),
+                observation_id=format(context.span_id, "016x") if key.startswith("langfuse.observation.") else None,
+                field=field_name,
+            )
+            reference: Final = _MEDIA_JSON.validate_json(dumps(media, cls=EventSerializer))
+            return _with_media_reference(data, candidate[0], reference) if isinstance(reference, str) else data
+        except Exception as error:  # noqa: BLE001  # SDK conversion and serialization can raise arbitrary exceptions
+            verbose_logger.warning(
+                "Langfuse media conversion failed for an item in %s (%s), keeping the item", key, type(error).__name__
+            )
+            return data
+
+
+class _MediaSpanQueue:
+    def __init__(
+        self,
+        media: _MediaUploads,
+        send: Callable[[Sequence[ReadableSpan]], SpanExportResult],
+        close: Callable[[], None],
+    ) -> None:
+        self.media: Final = media
+        self.send: Final = send
+        self.close: Final = close
+        self.closed = False
+        self._reset()
+        if hasattr(os, "register_at_fork"):
+            queue_ref: Final = ref(self)
+
+            def reinitialize() -> None:
+                if (queue := queue_ref()) is not None:
+                    queue._reset()
+
+            os.register_at_fork(after_in_child=reinitialize)
+
+    def _reset(self) -> None:
+        self.queue: Queue[ReadableSpan | None] = Queue(_MAX_QUEUE_SIZE)
+        self.condition: threading.Condition = threading.Condition()
+        self.worker: threading.Thread = threading.Thread(target=self._run, name="langfuse-media", daemon=True)
+        self.submitted = 0
+        self.completed = 0
+        self.failed = False
+
+    def submit(self, span: ReadableSpan) -> bool:
+        with self.condition:
+            if self.closed:
+                return False
+            try:
+                self.queue.put_nowait(span)
+            except Full:
+                verbose_logger.error("Langfuse media span queue is full, exporting the span without media conversion")
+                return False
+            self.submitted += 1
+            if self.submitted == 1:
+                self.worker.start()
+            return True
+
+    def flush(self, timeout_millis: int) -> bool:
+        with self.condition:
+            target: Final = self.submitted
+            if not self.condition.wait_for(lambda: self.completed >= target, timeout_millis / 1000):
+                return False
+            delivered: Final = not self.failed
+            self.failed = False
+            return delivered
+
+    def shutdown(self) -> None:
+        with self.condition:
+            if self.closed:
+                return
+            self.closed = True
+            if self.submitted == 0:
+                self.close()
+                return
+            try:
+                self.queue.put_nowait(None)
+            except Full:
+                pass
+        self.worker.join(30)
+        if self.worker.is_alive():
+            verbose_logger.warning("Langfuse media is still uploading after the shutdown deadline")
+
+    def _run(self) -> None:
+        try:
+            while self._consume():
+                pass
+        finally:
+            self.close()
+
+    def _consume(self) -> bool:
+        try:
+            span: Final = self.queue.get(timeout=1)
+        except Empty:
+            return not self.closed
+        if span is None:
+            self.queue.task_done()
+            return False
+        delivered: Final = self._deliver(span)
+        with self.condition:
+            self.failed = self.failed or not delivered
+            self.completed += 1
+            self.condition.notify_all()
+        self.queue.task_done()
+        return True
+
+    def _deliver(self, span: ReadableSpan) -> bool:
+        token: Final = otel_context.attach(otel_context.set_value(_SUPPRESS_INSTRUMENTATION_KEY, True))
+        try:
+            return self.send((self.media.process(span),)) is SpanExportResult.SUCCESS
+        except Exception:  # noqa: BLE001  # a failed SDK upload must not stop the independent worker
+            verbose_logger.exception("Langfuse media span export failed")
+            return False
+        finally:
+            otel_context.detach(token)
 
 
 def enable_langfuse_debug_logging() -> None:
@@ -661,21 +1023,49 @@ class LangfuseSpanExporter(SpanExporter):
     as v2's injected httpx client did. A connect or read failure and a retryable status are re-sent after
     each delay, matching the v2 ingestion consumer; ``BatchSpanProcessor`` would otherwise drop the whole
     batch on the first exception. A 413 splits the batch in halves until each body fits or a single span
-    is left; that span is re-sent with its input, output and metadata replaced by the v2 consumer's
-    truncation marker, largest first, and dropped only when the fully truncated span is still refused.
+    is left; that span is re-sent with its output and metadata replaced by the truncation marker,
+    largest first, and dropped only when the fully truncated span is still refused. Input is preserved.
     """
 
     handler: HTTPHandler
     endpoint: str
     headers: Mapping[str, str]
     timeout: float
+    owns_handler: bool = False
     delays: Sequence[float] = (1.0, 2.0, 4.0)
+    max_event_size_bytes: int = field(
+        default_factory=lambda: int(os.environ.get("LANGFUSE_MAX_EVENT_SIZE_BYTES", _DEFAULT_MAX_EVENT_SIZE_BYTES))
+    )
+    media: _MediaUploads | None = None
+    media_queue: _MediaSpanQueue | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        if self.media is not None:
+            object.__setattr__(
+                self,
+                "media_queue",
+                _MediaSpanQueue(
+                    self.media, self._export_spans, self.handler.close if self.owns_handler else lambda: None
+                ),
+            )
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        immediate: Final = tuple(
+            span
+            for span in spans
+            if self.media is None
+            or self.media_queue is None
+            or not self.media.has_media(span)
+            or not self.media_queue.submit(span)
+        )
+        return self._export_spans(immediate) if immediate else SpanExportResult.SUCCESS
+
+    def _export_spans(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         """Halving a batch of n spans settles every span within ``n.bit_length()`` rounds plus one per truncation
         step, so the rounds are a fixed fold rather than a recursion."""
         rounds: Final = range(len(spans).bit_length() + 1 + len(_TRUNCATION_GROUPS))
-        final: Final = reduce(lambda halving, _: self._round(halving), rounds, _Halving(pending=(tuple(spans),)))
+        limited: Final = tuple(_limited_span(span, self.max_event_size_bytes) for span in spans)
+        final: Final = reduce(lambda halving, _: self._round(halving), rounds, _Halving(pending=(limited,)))
         return (
             SpanExportResult.SUCCESS
             if all(result is SpanExportResult.SUCCESS for result in final.settled)
@@ -762,10 +1152,13 @@ class LangfuseSpanExporter(SpanExporter):
         return "delivered"
 
     def shutdown(self) -> None:
-        return None
+        if self.media_queue is not None:
+            self.media_queue.shutdown()
+        elif self.owns_handler:
+            self.handler.close()
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
-        return True
+        return self.media_queue is None or self.media_queue.flush(timeout_millis)
 
 
 def _encode(spans: Sequence[ReadableSpan]) -> bytes | None:
@@ -786,14 +1179,31 @@ def _encodes(span: ReadableSpan) -> bool:
     return True
 
 
-def _build_span_exporter(*, public_key: str, secret_key: str, base_url: str) -> LangfuseSpanExporter:
+def _build_span_exporter(
+    *, public_key: str, secret_key: str, base_url: str, handler: HTTPHandler | None = None
+) -> LangfuseSpanExporter:
     """Endpoint, headers and export path are the v4 SDK span processor's, so the server treats the spans as SDK
     traffic; the 20 s timeout and the retry count are what the v2 consumer used. The ingestion-version header is
     the one Langfuse's compatibility matrix asks a v4 producer to send."""
     export_path: Final = os.getenv("LANGFUSE_OTEL_TRACES_EXPORT_PATH") or "/api/public/otel/v1/traces"
     encoded_auth: Final = b64encode(f"{public_key}:{secret_key}".encode()).decode("ascii")
+    http_handler: Final = HTTPHandler(timeout=configured_timeout()) if handler is None else handler
+    media_api: Final = LangfuseAPI(
+        base_url=base_url,
+        username=public_key,
+        password=secret_key,
+        httpx_client=http_handler.client,
+        timeout=configured_timeout(),
+    )
+    media_requests: Final = _MediaApi(
+        media=_MediaEndpoints(
+            get_upload_url=partial(media_api.media.get_upload_url, request_options=_NO_REST_RETRIES),
+            patch=partial(media_api.media.patch, request_options=_NO_REST_RETRIES),
+        )
+    )
+    media_storage: Final = _MediaStorageClient(client=http_handler.client, timeout=configured_timeout())
     return LangfuseSpanExporter(
-        handler=get_httpx_client(),
+        handler=http_handler,
         endpoint=f"{base_url.rstrip('/')}/{export_path.lstrip('/')}",
         headers=MappingProxyType(
             {
@@ -806,7 +1216,15 @@ def _build_span_exporter(*, public_key: str, secret_key: str, base_url: str) -> 
             }
         ),
         timeout=configured_timeout(),
+        owns_handler=handler is None,
         delays=tuple(2.0 ** min(attempt, _MAX_BACKOFF_EXPONENT) for attempt in range(configured_max_retries())),
+        media=_MediaUploads(
+            manager=_RetryingMediaManager(
+                api=media_requests,
+                storage=media_storage,
+                max_attempts=configured_max_retries() + 1,
+            ),
+        ),
     )
 
 
@@ -839,7 +1257,7 @@ class _ExportLedger(SpanExporter):
         self.exporter.shutdown()
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
-        return self.exporter.force_flush(timeout_millis)
+        return self.exporter.force_flush(timeout_millis) is not False
 
 
 @dataclass(frozen=True, slots=True)
@@ -857,7 +1275,12 @@ class LangfuseTracing:
     def flush(self, timeout_millis: int = 30_000) -> bool:
         """``True`` only when the queue drained in time and every batch it held was accepted by the destination."""
         failed_before: Final = self.ledger.failed_batches
-        return self.provider.force_flush(timeout_millis) and self.ledger.failed_batches == failed_before
+        deadline: Final = monotonic() + timeout_millis / 1000
+        return (
+            self.provider.force_flush(timeout_millis)
+            and self.ledger.force_flush(max(0, int((deadline - monotonic()) * 1000)))
+            and self.ledger.failed_batches == failed_before
+        )
 
     def shutdown(self) -> None:
         self.provider.shutdown()

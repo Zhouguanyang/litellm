@@ -15,7 +15,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, cast
 
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm import verbose_logger
@@ -36,6 +36,7 @@ from litellm.types.llms.openai import (
     PromptCacheBreakpoint,
 )
 from litellm.types.utils import (
+    CallTypes,
     Choices,
     ExtractedFileData,
     FileTypes,
@@ -50,6 +51,13 @@ if TYPE_CHECKING:  # newer pattern to avoid importing pydantic objects on __init
 DEFAULT_USER_CONTINUE_MESSAGE: Final = ChatCompletionUserMessage(content="Please continue.", role="user")
 
 DEFAULT_ASSISTANT_CONTINUE_MESSAGE: Final = ChatCompletionAssistantMessage(content="Please continue.", role="assistant")
+GOOGLE_GENERATE_CONTENT_CALL_TYPES: Final = (
+    CallTypes.generate_content.value,
+    CallTypes.agenerate_content.value,
+    CallTypes.generate_content_stream.value,
+    CallTypes.agenerate_content_stream.value,
+)
+_GOOGLE_LOGGING_REQUEST: Final = TypeAdapter(Mapping[str, object])
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LoggingClass
@@ -290,6 +298,62 @@ def as_openai_image_part(part: Mapping[str, object]) -> ChatCompletionImageObjec
     """
     url: Final = _image_part_url(part)
     return {"type": "image_url", "image_url": {"url": url}} if url else None
+
+
+def image_response_data_uri(part: Mapping[str, object]) -> tuple[str, str] | None:
+    from litellm.litellm_core_utils.token_counter import get_image_type
+
+    field: Final = "result" if part.get("type") == "image_generation_call" else "b64_json"
+    encoded: Final = part.get(field)
+    if not isinstance(encoded, str) or not encoded:
+        return None
+    try:
+        signature: Final = base64.b64decode(encoded[:32], validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    image_type: Final = get_image_type(signature)
+    return (field, f"data:image/{image_type};base64,{encoded}") if image_type is not None else None
+
+
+def base64_media_data_uri(value: JsonValue) -> tuple[tuple[str, ...], str] | None:
+    if isinstance(value, str):
+        separator: Final = value.find(",")
+        return (
+            ((), value)
+            if value.startswith("data:") and separator >= 0 and value[:separator].endswith(";base64")
+            else None
+        )
+    if not isinstance(value, dict):
+        return None
+    image: Final = image_response_data_uri(value)
+    if image is not None:
+        return (image[0],), image[1]
+    if value.get("type") in ("base64", "media"):
+        mime: Final = value.get("media_type") if value.get("type") == "base64" else value.get("mime_type")
+        encoded: Final = value.get("data")
+        if isinstance(mime, str) and isinstance(encoded, str):
+            return ("data",), f"data:{mime};base64,{encoded}"
+    for key in ("inline_data", "inlineData"):
+        if (
+            isinstance(inline := value.get(key), dict)
+            and isinstance(content_type := inline.get("mime_type") or inline.get("mimeType"), str)
+            and isinstance(data := inline.get("data"), str)
+        ):
+            return (key, "data"), f"data:{content_type};base64,{data}"
+    return None
+
+
+def google_generate_content_input(request: Mapping[str, object]) -> Mapping[str, object] | None:
+    if "contents" not in request:
+        return None
+    fields: Final = ("contents", "systemInstruction", "tools", "toolConfig", "cachedContent", "continuationToken")
+    return {key: request[key] for key in fields if key in request}
+
+
+def google_generate_content_logging_input(call_type: object, request: object) -> Mapping[str, object] | None:
+    if call_type not in GOOGLE_GENERATE_CONTENT_CALL_TYPES or not isinstance(request, dict):
+        return None
+    return google_generate_content_input(_GOOGLE_LOGGING_REQUEST.validate_python(request))
 
 
 def request_contains_image_content(messages: Sequence[Mapping[str, object]]) -> bool:

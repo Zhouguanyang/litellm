@@ -515,6 +515,55 @@ def test_vertex_ai_thinking_image_part_is_not_output_image():
     assert images[0]["image_url"]["url"] == "data:image/png;base64,final-image"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("block_reason", ["", None])
+def test_empty_prompt_block_reason_preserves_generated_images(stream: bool, block_reason: str | None) -> None:
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import ModelResponseIterator
+
+    logging_obj: Final = Logging(
+        model="example-model",
+        messages=[],
+        stream=stream,
+        call_type="completion",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id="empty-prompt-block-reason",
+        function_id="empty-prompt-block-reason",
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+    body: Final = {
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": [{"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}}]},
+                "finishReason": "STOP",
+                "index": 0,
+                "safetyRatings": None,
+            }
+        ],
+        "promptFeedback": {"blockReason": block_reason, "safetyRatings": None},
+        "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 2, "totalTokenCount": 3},
+        "responseId": "upstream-image-response",
+    }
+    response: Final = (
+        ModelResponseIterator(streaming_response=[], sync_stream=True, logging_obj=logging_obj).chunk_parser(body)
+        if stream
+        else VertexGeminiConfig().transform_google_generate_content_to_openai_model_response(
+            completion_response=body,
+            model_response=ModelResponse(),
+            model="example-model",
+            logging_obj=logging_obj,
+            raw_response=httpx.Response(200),
+        )
+    )
+    message: Final = response.choices[0].delta if stream else response.choices[0].message
+
+    assert response.id == body["responseId"]
+    assert response.choices[0].finish_reason == "stop"
+    assert message.images[0]["image_url"]["url"] == "data:image/png;base64,aW1hZ2U="
+
+
 def test_vertex_ai_empty_content():
     from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
         VertexGeminiConfig,

@@ -11,10 +11,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast, runtime_checkable
 
 from packaging.version import Version
+from pydantic import TypeAdapter
 
 import litellm
 from litellm._logging import verbose_logger
-from litellm.constants import MAX_LANGFUSE_INITIALIZED_CLIENTS
+from litellm.constants import MAX_LANGFUSE_INITIALIZED_CLIENTS, REDACTED_BY_LITELLM
 from litellm.integrations.langfuse.langfuse_mock_client import (
     create_mock_langfuse_client,
     should_use_langfuse_mock,
@@ -27,6 +28,7 @@ from litellm.litellm_core_utils.core_helpers import (
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
     validate_langfuse_environment_value,
 )
+from litellm.litellm_core_utils.prompt_templates.common_utils import GOOGLE_GENERATE_CONTENT_CALL_TYPES
 from litellm.litellm_core_utils.redact_messages import redact_user_api_key_info
 from litellm.llms.custom_httpx.http_handler import get_httpx_client
 from litellm.responses.utils import ResponseAPILoggingUtils
@@ -57,12 +59,23 @@ else:
 
 _DENIED_STEERING_KEYS: Final = frozenset({"headers", "endpoint", "caching_groups", "previous_models"})
 _NO_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
+_LOG_EVENT_FIELDS: Final = TypeAdapter(Mapping[str, object])
 _REDACTED_PROXY_HEADERS: Final[frozenset[str]] = frozenset({"authorization", "cookie", "referer"})
 
 
 def _object_mapping(value: object) -> Mapping[str, object] | None:
     """Return ``value`` as an opaque mapping when it is a dict."""
     return value if isinstance(value, dict) else None
+
+
+def _native_google_input(kwargs: Mapping[str, object]) -> Mapping[str, object] | None:
+    if kwargs.get("messages") == [{"role": "user", "content": REDACTED_BY_LITELLM}]:
+        return None
+    if kwargs.get("call_type") not in GOOGLE_GENERATE_CONTENT_CALL_TYPES or "input" not in kwargs:
+        return None
+    logged_input: Final = kwargs.get("input")
+    native_input: Final = _object_mapping(logged_input)
+    return native_input if native_input is not None else {"messages": logged_input}
 
 
 def _widened_items(mapping: Mapping[str, object]) -> Iterable[tuple[object, object]]:
@@ -129,9 +142,7 @@ def _get_langfuse_token_usage(usage_obj: _UsageObject | None) -> tuple[int, int,
     completion_tokens: Final = completion_tokens_value if isinstance(completion_tokens_value, int) else 0
     total_tokens_value: Final = getattr(chat_usage, "total_tokens", None)
     total_tokens: Final = (
-        total_tokens_value
-        if isinstance(total_tokens_value, int)
-        else prompt_tokens + completion_tokens
+        total_tokens_value if isinstance(total_tokens_value, int) else prompt_tokens + completion_tokens
     )
 
     return prompt_tokens, completion_tokens, total_tokens or 0
@@ -513,15 +524,19 @@ class LangFuseLogger:
             metadata = self.add_metadata_from_header(litellm_params, metadata)
             optional_params: Final = safe_deep_copy(kwargs.get("optional_params", {}))
 
-            prompt: Final = {"messages": kwargs.get("messages")}
+            request_fields: Final = _LOG_EVENT_FIELDS.validate_python(kwargs)
+            native_input: Final = _native_google_input(request_fields)
+            prompt: Final = (
+                dict(native_input) if native_input is not None else {"messages": request_fields.get("messages")}
+            )
 
             functions: Final = optional_params.pop("functions", None)
             tools: Final = optional_params.pop("tools", None)
             # Remove secret_fields to prevent leaking sensitive data (e.g., authorization headers)
             optional_params.pop("secret_fields", None)
-            if functions is not None:
+            if functions is not None and native_input is None:
                 prompt["functions"] = functions
-            if tools is not None:
+            if tools is not None and native_input is None:
                 prompt["tools"] = tools
 
             # langfuse only accepts str, int, bool, float for logging
@@ -871,7 +886,9 @@ class LangFuseLogger:
                 if _usage_obj:
                     prompt_tokens, completion_tokens, total_tokens = _get_langfuse_token_usage(_usage_obj)
 
-                    cache_creation_input_tokens: Final = _get_usage_value(_usage_obj, "cache_creation_input_tokens") or 0
+                    cache_creation_input_tokens: Final = (
+                        _get_usage_value(_usage_obj, "cache_creation_input_tokens") or 0
+                    )
                     cache_read_input_tokens: Final = _extract_cache_read_input_tokens(_usage_obj)
 
                     usage = {
@@ -936,6 +953,7 @@ class LangFuseLogger:
 
             # langfuse ships in the proxy-runtime extra, so this module must import cleanly without it
             from litellm.integrations.langfuse.langfuse_sdk import (
+                contains_langfuse_media,
                 observation_attributes,
                 resolve_observation_id,
                 resolve_trace_id,
@@ -958,9 +976,15 @@ class LangFuseLogger:
                 tags=trace_params.get("tags"),
                 metadata=trace_params.get("metadata"),
                 public=trace_public,
-                input=None if generation_is_trace_root and trace_input == generation_params["input"] else trace_input,
+                input=None
+                if generation_is_trace_root
+                and trace_input == generation_params["input"]
+                and not contains_langfuse_media(trace_input)
+                else trace_input,
                 output=None
-                if generation_is_trace_root and trace_output == generation_params["output"]
+                if generation_is_trace_root
+                and trace_output == generation_params["output"]
+                and not contains_langfuse_media(trace_output)
                 else trace_output,
             )
             generation_attributes: Final = observation_attributes(
