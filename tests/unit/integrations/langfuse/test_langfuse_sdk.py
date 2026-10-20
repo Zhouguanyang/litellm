@@ -5,28 +5,38 @@ API has no observation start time, so a callback running after the model call wo
 otherwise record its own duration instead of the call's.
 """
 
+import gc
 import json
 import logging
 import threading
 import time
 import uuid
 from base64 import b64encode
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+from hashlib import sha256
 from time import monotonic, sleep
 from types import MappingProxyType, SimpleNamespace
 from typing import Final
+from weakref import finalize
 
 import httpx
 import opentelemetry.trace as otel_trace
 import pytest
+from backoff import _sync as backoff_sync
 from langfuse import LangfuseOtelSpanAttributes as A
+from langfuse._utils.serializer import EventSerializer
 from langfuse.api.core import http_client as langfuse_http_client
 from langfuse.api.core.api_error import ApiError
 from langfuse.api.core.request_options import RequestOptions
+from langfuse.media import LangfuseMedia
+from opentelemetry.instrumentation.utils import is_instrumentation_enabled
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
-from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import JsonValue
 
 from litellm.integrations.langfuse.langfuse import (
     MINIMUM_LANGFUSE_VERSION,
@@ -41,6 +51,7 @@ from litellm.integrations.langfuse.langfuse_sdk import (
     LangfuseTracing,
     _build_span_exporter,
     _encode,
+    _MediaSpanQueue,
     acquire_langfuse_tracing,
     build_langfuse_client,
     build_langfuse_tracing,
@@ -877,9 +888,7 @@ def test_release_of_a_channel_the_registry_never_handed_out_is_a_no_op():
 def test_flush_langfuse_tracing_exports_the_queued_spans_of_every_channel(monkeypatch: pytest.MonkeyPatch):
     """The proxy shutdown hook flushes through this, so a span finished just before a
     graceful restart must reach the exporter without waiting for the batch interval."""
-    exporters: Final[
-        list[InMemorySpanExporter]
-    ] = []
+    exporters: Final[list[InMemorySpanExporter]] = []
 
     def build_in_memory(*, public_key: str, secret_key: str, base_url: str) -> InMemorySpanExporter:
         exporters.append(InMemorySpanExporter())
@@ -1423,15 +1432,1246 @@ def _generation_span(**attributes: str):
     return span
 
 
-def test_exporter_truncates_a_single_oversized_span_the_way_v2_did_instead_of_dropping_it(monkeypatch, caplog):
-    """v2 replaced the largest of input, output and metadata with a marker and still delivered the observation; a
-    vision request over a self-hosted ingress cap used to lose the whole generation, model and usage included."""
+def _export_and_flush(exporter: LangfuseSpanExporter, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+    try:
+        result: Final = exporter.export(spans)
+        assert exporter.force_flush(timeout_millis=5000)
+        return result
+    finally:
+        exporter.shutdown()
+
+
+def test_retired_exporter_is_not_kept_alive_by_fork_hooks() -> None:
+    collected: Final = threading.Event()
+
+    def retire() -> None:
+        exporter: Final = _build_span_exporter(
+            public_key="pk",
+            secret_key="sk",
+            base_url="https://lf.internal.example",
+            handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200)))),
+        )
+        finalize(exporter, collected.set)
+        exporter.shutdown()
+
+    retire()
+    gc.collect()
+
+    assert collected.is_set()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_media_worker_suppresses_instrumentation_and_restores_it_after_delivery(
+    fails: bool,
+) -> None:
+    states: Final[list[bool]] = []
+    closed: Final[list[bool]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        states.append(is_instrumentation_enabled())
+        if request.url.path == "/api/public/media":
+            return httpx.Response(200, json={"mediaId": "server-image", "uploadUrl": "https://storage.example/image"})
+        if fails and request.url.path.endswith("/traces"):
+            raise RuntimeError("export failed")
+        return httpx.Response(200, json={})
+
+    class Transport(httpx.MockTransport):
+        def close(self) -> None:
+            closed.append(is_instrumentation_enabled())
+            super().close()
+
+    client: Final = httpx.Client(transport=Transport(respond))
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=client),
+    )
+    assert exporter.media is not None
+    queue: Final = _MediaSpanQueue(exporter.media, exporter._export_spans, client.close)
+    data_uri: Final = "data:image/png;base64," + b64encode(b"image-bytes").decode()
+    span: Final = _generation_span(**{"langfuse.observation.output": data_uri})
+
+    assert is_instrumentation_enabled()
+    try:
+        assert queue.submit(span)
+        assert queue.flush(timeout_millis=5000) is (not fails)
+    finally:
+        queue.shutdown()
+        exporter.shutdown()
+
+    assert states == [False, False, False, False]
+    assert closed == [True]
+    assert is_instrumentation_enabled()
+
+
+@pytest.mark.parametrize("stage", ["registration", "storage", "confirmation"])
+def test_slow_media_retries_do_not_block_other_spans_or_extend_the_flush_deadline(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_RETRIES", "1")
+    monkeypatch.setattr(backoff_sync, "time", SimpleNamespace(sleep=lambda _: None))
+    release: Final = threading.Event()
+    entered: Final = threading.Event()
+    exported: Final = threading.Event()
+    requests: Final[list[httpx.Request]] = []
+    results: Final[list[SpanExportResult]] = []
+    image: Final = b"image-bytes"
+    data_uri: Final = "data:image/png;base64," + b64encode(image).decode()
+    media_span: Final = _generation_span(**{"langfuse.observation.output": data_uri})
+    healthy: Final = _generation_span(**{"langfuse.observation.output": "healthy"})
+    later: Final = _generation_span(**{"langfuse.observation.output": "later"})
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        target: Final = (
+            "registration"
+            if request.url.path == "/api/public/media"
+            else "storage"
+            if request.method == "PUT"
+            else "confirmation"
+            if request.method == "PATCH"
+            else "trace"
+        )
+        if target == stage and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "media request was never released"
+            raise httpx.ReadTimeout("media storage timed out", request=request)
+        if target == "registration":
+            return httpx.Response(200, json={"mediaId": "server-image", "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={})
+
+    client: Final = httpx.Client(transport=httpx.MockTransport(transport))
+    exporter: Final = _build_span_exporter(
+        public_key="pk", secret_key="sk", base_url="https://lf.internal.example", handler=HTTPHandler(client=client)
+    )
+
+    def export() -> None:
+        results.append(exporter.export((media_span, healthy)))
+        exported.set()
+
+    worker: Final = threading.Thread(target=export, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert exported.wait(2), "media retries blocked the healthy span in the same batch"
+        assert results == [SpanExportResult.SUCCESS]
+        assert exporter.export((later,)) is SpanExportResult.SUCCESS
+        delivered: Final = tuple(
+            _decoded_attributes(request.content) for request in requests if request.url.path.endswith("/traces")
+        )
+        assert delivered == (
+            {"langfuse.observation.output": "healthy"},
+            {"langfuse.observation.output": "later"},
+        )
+        assert exporter.force_flush(timeout_millis=0) is False
+        assert not client.is_closed
+    finally:
+        release.set()
+        worker.join(5)
+        assert exporter.force_flush(timeout_millis=5000)
+        exporter.shutdown()
+        client.close()
+
+    delivered_media: Final = _decoded_attributes(requests[-1].content)["langfuse.observation.output"]
+    assert LangfuseMedia.parse_reference_string(json.loads(delivered_media))["media_id"] == "server-image"
+
+
+@pytest.mark.parametrize(
+    "malformed", ["data:image/png;base64,example", {"type": "base64", "media_type": "image/png", "data": None}]
+)
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_malformed_media_does_not_prevent_other_images_from_uploading_before_truncation(
+    monkeypatch: pytest.MonkeyPatch, malformed: JsonValue, position: int
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "1024")
+    images: Final = (b"first-image", b"second-image")
+    valid: Final = tuple("data:image/png;base64," + b64encode(image).decode() for image in images)
+    parts: Final = (*valid[:position], malformed, *valid[position:])
+    output: Final = json.dumps({"content": parts, "text": "t" * 2048})
+    span: Final = _generation_span(**{"langfuse.observation.output": output})
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/public/media":
+            digest: Final = json.loads(request.content)["sha256Hash"]
+            media_id: Final = digest.replace("+", "-").replace("/", "_")[:22]
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": f"https://storage.example/{media_id}"})
+        return httpx.Response(200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    assert tuple(request.content for request in requests if request.method == "PUT") == images
+    registrations: Final = tuple(
+        json.loads(request.content) for request in requests if request.url.path == "/api/public/media"
+    )
+    assert tuple(item["sha256Hash"] for item in registrations) == tuple(
+        b64encode(sha256(image).digest()).decode() for image in images
+    )
+    assert all(item["observationId"] == format(span.context.span_id, "016x") for item in registrations)
+    assert _decoded_attributes(requests[-1].content) == {
+        "langfuse.observation.output": "<truncated due to size exceeding limit>",
+    }
+
+
+@pytest.mark.parametrize("stage", ["registration", "storage", "confirmation"])
+def test_nested_media_failures_respect_the_retry_budget_and_keep_other_attachments(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_RETRIES", "1")
+    monkeypatch.setattr(backoff_sync, "time", SimpleNamespace(sleep=lambda _: None))
+    bad: Final = b"bad-image"
+    good: Final = b"good-image"
+    bad_hash: Final = b64encode(sha256(bad).digest()).decode()
+    parts: Final = [{"image_url": "data:image/png;base64," + b64encode(image).decode()} for image in (bad, good)]
+    span: Final = _generation_span(**{"langfuse.observation.output": json.dumps({"content": parts})})
+    requests: Final[list[httpx.Request]] = []
+    failures: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        target: Final = (
+            "registration"
+            if request.url.path == "/api/public/media"
+            else "storage"
+            if request.method == "PUT"
+            else "confirmation"
+            if request.method == "PATCH"
+            else "trace"
+        )
+        media_id: Final = (
+            "bad"
+            if target == "registration" and json.loads(request.content)["sha256Hash"] == bad_hash
+            else "good"
+            if target == "registration"
+            else request.url.path.rsplit("/", 1)[-1]
+        )
+        if target == stage and media_id == "bad":
+            failures.append(request)
+            return httpx.Response(503, json={"message": "unavailable"})
+        if target == "registration":
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": f"https://storage.example/{media_id}"})
+        return httpx.Response(200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    assert len(failures) == 2
+    assert tuple(request.content for request in requests if request.method == "PUT" and request.content == good) == (
+        good,
+    )
+    delivered: Final = json.loads(_decoded_attributes(requests[-1].content)["langfuse.observation.output"])
+    assert delivered["content"][0] == parts[0]
+    assert LangfuseMedia.parse_reference_string(delivered["content"][1]["image_url"])["media_id"] == "good"
+
+
+def test_media_queue_reports_a_rejected_span_and_keeps_exporting_after_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_RETRIES", "0")
+    data_uri: Final = "data:image/png;base64," + b64encode(b"image-bytes").decode()
+    span: Final = _generation_span(**{"langfuse.observation.output": data_uri})
+    rejected: Final = threading.Event()
+    delivered: Final = threading.Event()
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/public/media":
+            return httpx.Response(200, json={"mediaId": "server-image", "uploadUrl": None})
+        if not rejected.is_set():
+            rejected.set()
+            return httpx.Response(503)
+        delivered.set()
+        return httpx.Response(200)
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+    try:
+        assert exporter.export((span,)) is SpanExportResult.SUCCESS
+        assert exporter.force_flush(timeout_millis=5000) is False
+        assert rejected.is_set() and not delivered.is_set()
+        assert exporter.export((span,)) is SpanExportResult.SUCCESS
+        assert exporter.force_flush(timeout_millis=5000) is True
+        assert delivered.is_set()
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "@@@langfuseMedia:type=image/png|id=existing|source=bytes@@@",
+        },
+        {
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": "@@@langfuseMedia:type=image/png|id=existing|source=bytes@@@",
+            }
+        },
+    ],
+)
+def test_exporter_keeps_existing_media_references_without_registering_them_again(wrapper: JsonValue) -> None:
+    content: Final = json.dumps(wrapper)
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert (
+        _export_and_flush(exporter, (_generation_span(**{"langfuse.observation.output": content}),))
+        is SpanExportResult.SUCCESS
+    )
+
+    (request,) = requests
+    assert request.url.path.endswith("/traces")
+    assert _decoded_attributes(request.content) == {"langfuse.observation.output": content}
+
+
+@pytest.mark.parametrize("with_media", [False, True])
+def test_retiring_exporter_keeps_shared_transport_available_to_provider_clients(
+    monkeypatch: pytest.MonkeyPatch, with_media: bool
+) -> None:
+    import litellm
+    from litellm.caching.llm_caching_handler import LLMClientCache
+    from litellm.llms.custom_httpx.http_handler import get_httpx_client
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/public/media":
+            return httpx.Response(200, json={"mediaId": "server-image", "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={"content": "answer"})
+
+    class Transport(httpx.MockTransport):
+        closed: bool = False
+
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            if self.closed:
+                raise RuntimeError("shared transport has been closed")
+            return super().handle_request(request)
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    transport: Final = Transport(respond)
+    monkeypatch.setattr(litellm, "force_ipv4", False)
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    monkeypatch.setattr(litellm, "sync_transport", transport, raising=False)
+    provider: Final = get_httpx_client()
+    exporter: Final = _build_span_exporter(public_key="pk", secret_key="sk", base_url="https://lf.internal.example")
+    client: Final = exporter.handler.client
+    output: Final = "data:image/png;base64," + b64encode(b"image").decode() if with_media else "answer"
+
+    try:
+        assert provider.post("https://provider.example/completions", json={}).json() == {"content": "answer"}
+        assert (
+            _export_and_flush(exporter, (_generation_span(**{"langfuse.observation.output": output}),))
+            is SpanExportResult.SUCCESS
+        )
+        exporter.shutdown()
+
+        assert client.is_closed
+        assert provider.post("https://provider.example/completions", json={}).json() == {"content": "answer"}
+    finally:
+        exporter.shutdown()
+        provider.close()
+        transport.close()
+
+
+def test_exporter_keeps_uploading_media_and_traces_after_the_shared_client_is_evicted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm.caching.evicted_client_closer import EvictedClientCloser
+    from litellm.caching.llm_caching_handler import LLMClientCache
+    from litellm.llms.custom_httpx.http_handler import get_httpx_client
+
+    monkeypatch.setenv("LANGFUSE_MAX_RETRIES", "0")
+    image: Final = b"image-bytes"
+    data_uri: Final = "data:image/png;base64," + b64encode(image).decode()
+    reference: Final = json.loads(json.dumps(LangfuseMedia(base64_data_uri=data_uri), cls=EventSerializer))
+    media_id: Final = LangfuseMedia.parse_reference_string(reference)["media_id"]
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/public/media":
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={})
+
+    cache: Final = LLMClientCache(evicted_client_closer=EvictedClientCloser(grace_seconds=0, clock=lambda: 0))
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", cache)
+    monkeypatch.setattr(litellm, "sync_transport", httpx.MockTransport(transport), raising=False)
+    shared: Final = get_httpx_client().client
+    exporter: Final = _build_span_exporter(public_key="pk", secret_key="sk", base_url="https://lf.internal.example")
+    cache.delete_cache("httpx_client")
+    assert shared.is_closed
+    owned: Final = exporter.handler.client
+    span: Final = _generation_span(
+        **{"langfuse.observation.input": "question", "langfuse.observation.output": data_uri}
+    )
+
+    try:
+        assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+        registration, upload, confirmation, trace = requests
+        assert json.loads(registration.content)["traceId"] == format(span.context.trace_id, "032x")
+        assert upload.method == "PUT" and upload.content == image
+        assert confirmation.method == "PATCH" and confirmation.url.path.endswith(media_id)
+        assert _decoded_attributes(trace.content) == {
+            "langfuse.observation.input": "question",
+            "langfuse.observation.output": json.dumps(reference),
+        }
+    finally:
+        exporter.shutdown()
+    assert owned.is_closed
+
+
+@pytest.mark.parametrize("already_uploaded", [False, True])
+@pytest.mark.parametrize("truncated", [False, True])
+def test_exporter_uses_server_media_ids_and_keeps_media_links_when_output_is_truncated(
+    monkeypatch: pytest.MonkeyPatch, already_uploaded: bool, truncated: bool
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "4096")
+    image: Final = b"image-bytes"
+    data_uri: Final = "data:image/png;base64," + b64encode(image).decode()
+    media_id: Final = "server-assigned-image"
+    original: Final = json.dumps({"text": "t" * (8192 if truncated else 10), "image": data_uri})
+    span: Final = _generation_span(**{"langfuse.observation.output": original, "langfuse.trace.output": original})
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/public/media":
+            return httpx.Response(
+                200,
+                json={"mediaId": media_id, "uploadUrl": None if already_uploaded else "https://storage.example/image"},
+            )
+        return httpx.Response(200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    registrations: Final = tuple(
+        {key: value for key, value in json.loads(request.content).items() if value is not None}
+        for request in requests
+        if request.url.path == "/api/public/media"
+    )
+    assert registrations == (
+        {
+            "contentLength": len(image),
+            "contentType": "image/png",
+            "sha256Hash": b64encode(sha256(image).digest()).decode(),
+            "traceId": format(span.context.trace_id, "032x"),
+            "observationId": format(span.context.span_id, "016x"),
+            "field": "output",
+        },
+        {
+            "contentLength": len(image),
+            "contentType": "image/png",
+            "sha256Hash": b64encode(sha256(image).digest()).decode(),
+            "traceId": format(span.context.trace_id, "032x"),
+            "field": "output",
+        },
+    )
+    uploads: Final = tuple(request.content for request in requests if request.method == "PUT")
+    assert uploads == (() if already_uploaded else (image, image))
+    confirmations: Final = tuple(request for request in requests if request.method == "PATCH")
+    assert tuple(request.url.path for request in confirmations) == (
+        () if already_uploaded else (f"/api/public/media/{media_id}",) * 2
+    )
+    exported: Final = _decoded_attributes(requests[-1].content)
+    if truncated:
+        assert exported == {
+            "langfuse.observation.output": "<truncated due to size exceeding limit>",
+            "langfuse.trace.output": "<truncated due to size exceeding limit>",
+        }
+    else:
+        for value in exported.values():
+            content: Final = json.loads(value)
+            assert content["text"] == "t" * 10
+            assert LangfuseMedia.parse_reference_string(content["image"])["media_id"] == media_id
+
+
+@pytest.mark.parametrize("input_size", [128, 8192])
+def test_exporter_preserves_input_and_small_output_when_the_event_exceeds_the_limit(
+    monkeypatch: pytest.MonkeyPatch, input_size: int
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "1024")
+    attributes: Final = MappingProxyType(
+        {
+            "langfuse.observation.input": "i" * input_size,
+            "langfuse.trace.input": "i" * input_size,
+            "langfuse.observation.output": "answer",
+            "langfuse.observation.metadata.note": "m" * 8192,
+        }
+    )
+    exporter, seen = _exporter_over([200])
+
+    assert _export_and_flush(exporter, (_generation_span(**attributes),)) is SpanExportResult.SUCCESS
+
+    (request,) = seen
+    assert _decoded_attributes(request.content) == attributes
+
+
+@pytest.mark.parametrize("field", ["input", "output", "metadata"])
+@pytest.mark.parametrize("text_size", [0, 8192])
+@pytest.mark.parametrize("scope", ["observation", "trace"])
+def test_exporter_uploads_media_before_truncation_and_keeps_it_attached(
+    monkeypatch: pytest.MonkeyPatch, field: str, text_size: int, scope: str
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "4096")
+    image: Final = b"\x89PNG\r\n\x1a\n" + b"x" * 8192
+    data_uri: Final = "data:image/png;base64," + b64encode(image).decode()
+    reference: Final = json.loads(json.dumps(LangfuseMedia(base64_data_uri=data_uri), cls=EventSerializer))
+    media_id: Final = LangfuseMedia.parse_reference_string(reference)["media_id"]
+    content: Final = {"text": "t" * text_size, "image_url": {"url": data_uri}}
+    key: Final = f"langfuse.{scope}.{field}" + (".attachment" if field == "metadata" else "")
+    span: Final = _generation_span(**{key: json.dumps(content)})
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST" and request.url.path == "/api/public/media":
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={})
+
+    handler: Final = HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport)))
+    exporter: Final = _build_span_exporter(
+        public_key="pk", secret_key="sk", base_url="https://lf.internal.example", handler=handler
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    media_request, upload, confirmation, trace_request = requests
+    registered: Final = json.loads(media_request.content)
+    assert registered["traceId"] == format(span.context.trace_id, "032x")
+    assert registered.get("observationId") == (format(span.context.span_id, "016x") if scope == "observation" else None)
+    assert registered["field"] == field
+    assert registered["contentLength"] == len(image)
+    assert upload.method == "PUT" and upload.content == image
+    assert upload.headers["x-amz-checksum-sha256"] == registered["sha256Hash"]
+    assert confirmation.method == "PATCH" and confirmation.url.path.endswith(media_id)
+    assert json.loads(confirmation.content)["uploadHttpStatus"] == 200
+    exported: Final = _decoded_attributes(trace_request.content)
+    if field == "output" and text_size > 4096:
+        assert exported[key] == "<truncated due to size exceeding limit>"
+    else:
+        assert json.loads(exported[key]) == {"text": content["text"], "image_url": {"url": reference}}
+    assert span.attributes[key] == json.dumps(content)
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["local-limit", "http-413"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "gemini",
+        "chat",
+        "anthropic",
+        "images",
+        "responses",
+        "external-url",
+        "image-envelope-url",
+        "image-envelope-with-metadata",
+        "image-envelope-base64",
+        "chat-url",
+        "markdown",
+        "ipv6-url",
+    ],
+)
+def test_exporter_truncates_output_without_appending_media_across_api_shapes(
+    monkeypatch: pytest.MonkeyPatch, fallback: bool, shape: str
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "65536" if fallback else "4096")
+    image: Final = b"\x89PNG\r\n\x1a\n" + b"x" * 8192
+    encoded: Final = b64encode(image).decode()
+    data_uri: Final = "data:image/png;base64," + encoded
+    reference: Final = json.loads(json.dumps(LangfuseMedia(base64_data_uri=data_uri), cls=EventSerializer))
+    media_id: Final = LangfuseMedia.parse_reference_string(reference)["media_id"]
+    url: Final = (
+        "https://[::1]/image(1).png?signature=example"
+        if shape == "ipv6-url"
+        else "https://images.example/generated.png?signature=example"
+    )
+    text: Final = "t" * 8192
+    content: Final = {
+        "gemini": {
+            "candidates": [
+                {"content": {"parts": [{"text": text}, {"inlineData": {"mimeType": "image/png", "data": encoded}}]}}
+            ]
+        },
+        "chat": {"content": text, "images": [{"type": "image_url", "image_url": {"url": data_uri}}]},
+        "anthropic": {
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": encoded}},
+            ]
+        },
+        "images": [{"b64_json": encoded, "revised_prompt": text}],
+        "responses": [
+            {"type": "image_generation_call", "result": encoded},
+            {"type": "message", "content": [{"type": "output_text", "text": text}]},
+        ],
+        "external-url": [
+            {"url": url, "revised_prompt": text, "provider_specific_fields": {"url": "https://docs.example/page.png"}}
+        ],
+        "image-envelope-url": {"data": [{"url": url, "revised_prompt": text}]},
+        "image-envelope-with-metadata": {
+            "created": 1,
+            "data": [
+                {
+                    "url": url,
+                    "revised_prompt": text,
+                    "provider_specific_fields": {"url": "https://docs.example/page.png"},
+                }
+            ],
+            "usage": {"total_tokens": 1},
+        },
+        "image-envelope-base64": {"data": [{"b64_json": encoded, "revised_prompt": text}]},
+        "chat-url": {"content": text, "images": [{"type": "image_url", "image_url": {"url": url}}]},
+        "markdown": f"{text}\n![image]({url})",
+        "ipv6-url": [{"url": url, "revised_prompt": text}],
+    }[shape]
+    original: Final = json.dumps(content)
+    span: Final = _generation_span(**{"langfuse.observation.output": original, "langfuse.trace.output": original})
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/public/media":
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": "https://storage.example/image"})
+        if request.url.path.endswith("/traces") and fallback and len(request.content) > 3000:
+            return httpx.Response(413)
+        return httpx.Response(200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    uploads: Final = tuple(request for request in requests if request.method == "PUT")
+    remote: Final = shape in (
+        "external-url",
+        "image-envelope-url",
+        "image-envelope-with-metadata",
+        "chat-url",
+        "markdown",
+        "ipv6-url",
+    )
+    assert tuple(request.content for request in uploads) == (() if remote else (image, image))
+    expected: Final = "<truncated due to size exceeding limit>"
+    assert _decoded_attributes(requests[-1].content) == {
+        "langfuse.observation.output": expected,
+        "langfuse.trace.output": expected,
+    }
+    trace_posts: Final = tuple(request for request in requests if request.url.path.endswith("/traces"))
+    assert len(trace_posts) == (2 if fallback else 1)
+    assert span.attributes["langfuse.observation.output"] == original
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["local-limit", "http-413"])
+@pytest.mark.parametrize("with_images", [False, True], ids=["citations-only", "images-and-citations"])
+@pytest.mark.parametrize("shape", ["responses", "chat", "untyped"])
+def test_exporter_truncates_citation_heavy_output_without_appending_media_or_page_urls(
+    monkeypatch: pytest.MonkeyPatch, fallback: bool, with_images: bool, shape: str
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "65536" if fallback else "4096")
+    text: Final = "t" * 8192
+    pages: Final = tuple(f"https://docs.example/page/{index}.png?query=" + "q" * 256 for index in range(64))
+    annotations: Final = [
+        {
+            "responses": {"type": "url_citation", "url": url, "title": "page", "start_index": 0, "end_index": 1},
+            "chat": {
+                "type": "url_citation",
+                "url_citation": {"url": url, "title": "page", "start_index": 0, "end_index": 1},
+            },
+            "untyped": {"url": url, "title": "page"},
+        }[shape]
+        for url in pages
+    ]
+    reference: Final = json.loads(
+        json.dumps(LangfuseMedia(base64_data_uri="data:image/png;base64,eA=="), cls=EventSerializer)
+    )
+    image_url: Final = "https://images.example/generated?signature=example"
+    images: Final = (
+        [
+            {"type": "image_url", "image_url": {"url": reference}},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        if with_images
+        else []
+    )
+    original: Final = json.dumps(
+        [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": text, "annotations": annotations}],
+                "images": images,
+            }
+        ]
+    )
+    span: Final = _generation_span(
+        **{
+            "langfuse.observation.output": original,
+            "langfuse.trace.output": original,
+            "langfuse.observation.input": "question",
+        }
+    )
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(413 if len(request.content) > 2000 else 200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    expected: Final = "<truncated due to size exceeding limit>"
+    assert _decoded_attributes(requests[-1].content) == {
+        "langfuse.observation.output": expected,
+        "langfuse.trace.output": expected,
+        "langfuse.observation.input": "question",
+    }
+    assert len(requests) == (2 if fallback else 1)
+    assert span.attributes["langfuse.observation.output"] == original
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "source",
+        "nested-data",
+        "list-object",
+        "citation-data",
+        "untyped-citation-data",
+        "nested-array",
+        "nested-data-array",
+    ],
+)
+def test_exporter_does_not_preserve_page_urls_in_output_objects(monkeypatch: pytest.MonkeyPatch, shape: str) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "4096")
+    url: Final = "https://docs.example/page?query=" + "q" * 8192
+    content: Final = {
+        "source": {"source": {"url": url}},
+        "nested-data": {"source": {"data": [{"url": url}]}},
+        "list-object": {"object": "list", "data": [{"url": url}]},
+        "citation-data": {"data": [{"type": "url_citation", "url": url}]},
+        "untyped-citation-data": {"data": [{"url": url, "title": "page"}]},
+        "nested-array": [[{"url": url}]],
+        "nested-data-array": {"data": [[{"url": url}]]},
+    }[shape]
+    original: Final = json.dumps(content)
+    span: Final = _generation_span(**{"langfuse.observation.output": original})
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(413 if len(request.content) > 2000 else 200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    (request,) = requests
+    assert _decoded_attributes(request.content) == {
+        "langfuse.observation.output": "<truncated due to size exceeding limit>",
+    }
+
+
+@pytest.mark.parametrize("shape", ["images", "responses"])
+@pytest.mark.parametrize(
+    "mime,signature",
+    [("image/png", b"\x89PNG\r\n\x1a\n"), ("image/jpeg", b"\xff\xd8\xff"), ("image/webp", b"RIFFxxxxWEBP")],
+)
+def test_exporter_offloads_generated_image_bytes_before_applying_the_output_limit(
+    monkeypatch: pytest.MonkeyPatch, shape: str, mime: str, signature: bytes
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "4096")
+    image: Final = signature + b"x" * 8192
+    encoded: Final = b64encode(image).decode()
+    content: Final = (
+        [{"b64_json": encoded}] if shape == "images" else [{"type": "image_generation_call", "result": encoded}]
+    )
+    field: Final = "b64_json" if shape == "images" else "result"
+    reference: Final = json.loads(
+        json.dumps(LangfuseMedia(base64_data_uri=f"data:{mime};base64,{encoded}"), cls=EventSerializer)
+    )
+    media_id: Final = LangfuseMedia.parse_reference_string(reference)["media_id"]
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/public/media":
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert (
+        _export_and_flush(exporter, (_generation_span(**{"langfuse.observation.output": json.dumps(content)}),))
+        is SpanExportResult.SUCCESS
+    )
+
+    registration, upload, confirmation, trace = requests
+    assert json.loads(registration.content)["contentType"] == mime
+    assert upload.content == image
+    assert json.loads(confirmation.content)["uploadHttpStatus"] == 200
+    exported: Final = json.loads(_decoded_attributes(trace.content)["langfuse.observation.output"])
+    assert exported == [{**content[0], field: reference}]
+
+
+def test_exporter_uses_plain_markers_when_413_requires_truncating_output_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "65536")
+    first: Final = json.loads(
+        json.dumps(LangfuseMedia(base64_data_uri="data:image/png;base64,eA=="), cls=EventSerializer)
+    )
+    second: Final = json.loads(
+        json.dumps(LangfuseMedia(base64_data_uri="data:image/png;base64,eQ=="), cls=EventSerializer)
+    )
+    references: Final = (first, second, first)
+    span: Final = _generation_span(
+        **{
+            "langfuse.observation.input": "question",
+            "langfuse.observation.output": json.dumps({"text": "o" * 7000, "images": references}),
+            "langfuse.observation.metadata.attachment": json.dumps({"note": "m" * 8000, "images": references}),
+        }
+    )
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(413 if len(request.content) > 2000 else 200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    compact: Final = "<truncated due to size exceeding limit>"
+    assert len(requests) == 3
+    assert _decoded_attributes(requests[-1].content) == {
+        "langfuse.observation.input": "question",
+        "langfuse.observation.output": compact,
+        "langfuse.observation.metadata.truncated": compact,
+    }
+
+
+def test_exporter_stops_retrying_when_413_rejects_the_truncation_marker() -> None:
+    reference: Final = json.loads(
+        json.dumps(LangfuseMedia(base64_data_uri="data:image/png;base64,eA=="), cls=EventSerializer)
+    )
+    span: Final = _generation_span(**{"langfuse.observation.output": "x" * 8192 + reference})
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(413)
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.FAILURE
+
+    assert len(requests) == 2
+    assert _decoded_attributes(requests[-1].content) == {
+        "langfuse.observation.output": "<truncated due to size exceeding limit>",
+    }
+
+
+@pytest.mark.parametrize("field", ["input", "output", "metadata.note"])
+def test_exporter_keeps_malformed_media_and_delivers_other_fields_and_healthy_spans(
+    field: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    malformed: Final = '{"type":"base64","media_type":"image/png","data":null}'
+    key: Final = f"langfuse.observation.{field}"
+    broken: Final = _generation_span(**{key: malformed, "langfuse.observation.metadata.keep": "retained"})
+    healthy: Final = _generation_span(**{"langfuse.observation.output": "healthy"})
+    expected: Final = _encode((broken, healthy))
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    handler: Final = HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport)))
+    exporter: Final = _build_span_exporter(
+        public_key="pk", secret_key="sk", base_url="https://lf.internal.example", handler=handler
+    )
+
+    with caplog.at_level(logging.WARNING, logger="LiteLLM"):
+        assert _export_and_flush(exporter, (broken, healthy)) is SpanExportResult.SUCCESS
+
+    (request,) = requests
+    assert request.content == expected
+    assert malformed not in caplog.text
+
+
+@pytest.mark.parametrize("retries", [0, 1])
+@pytest.mark.parametrize("stage", ["registration", "storage", "confirmation"])
+@pytest.mark.parametrize("status", [400, 408, 409, 429, 503])
+def test_exporter_media_requests_respect_timeout_and_retry_budget(
+    monkeypatch: pytest.MonkeyPatch, stage: str, retries: int, status: int
+) -> None:
+    configured_timeout: Final = 1.25
+    monkeypatch.setenv("LANGFUSE_TIMEOUT", str(configured_timeout))
+    monkeypatch.setenv("LANGFUSE_MAX_RETRIES", str(retries))
+    monkeypatch.setattr(langfuse_http_client, "time", SimpleNamespace(sleep=lambda _: None, time=time.time))
+    monkeypatch.setattr(backoff_sync, "time", SimpleNamespace(sleep=lambda _: None))
+    data_uri: Final = "data:image/png;base64," + b64encode(b"image-bytes").decode()
+    reference: Final = json.loads(json.dumps(LangfuseMedia(base64_data_uri=data_uri), cls=EventSerializer))
+    media_id: Final = LangfuseMedia.parse_reference_string(reference)["media_id"]
+    requests: Final[list[httpx.Request]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        target: Final = (
+            "registration"
+            if request.url.path == "/api/public/media"
+            else "storage"
+            if request.method == "PUT"
+            else "confirmation"
+            if request.method == "PATCH"
+            else "trace"
+        )
+        if target == stage:
+            return httpx.Response(status, json={"message": "unavailable"})
+        if target == "registration":
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={})
+
+    shared_client: Final = httpx.Client(transport=httpx.MockTransport(transport), timeout=600)
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=shared_client),
+    )
+    span: Final = _generation_span(**{"langfuse.observation.output": data_uri})
+
+    assert _export_and_flush(exporter, (span,)) is SpanExportResult.SUCCESS
+
+    registration: Final = tuple(request for request in requests if request.url.path == "/api/public/media")
+    uploads: Final = tuple(request for request in requests if request.method == "PUT")
+    confirmations: Final = tuple(request for request in requests if request.method == "PATCH")
+    targeted: Final = {"registration": registration, "storage": uploads, "confirmation": confirmations}[stage]
+    assert len(targeted) == (1 if status == 400 else retries + 1)
+    assert all(
+        request.extensions["timeout"] == {part: configured_timeout for part in ("connect", "read", "write", "pool")}
+        for request in requests
+    )
+    assert shared_client.timeout == httpx.Timeout(600)
+    assert _decoded_attributes(requests[-1].content)["langfuse.observation.output"] == data_uri
+
+
+@pytest.mark.parametrize("status", [408, 409])
+@pytest.mark.parametrize("stage", ["registration", "confirmation"])
+def test_exporter_retries_transient_media_rest_failures_and_completes_the_upload(
+    monkeypatch: pytest.MonkeyPatch, status: int, stage: str
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_RETRIES", "1")
+    monkeypatch.setattr(backoff_sync, "time", SimpleNamespace(sleep=lambda _: None))
+    data_uri: Final = "data:image/png;base64," + b64encode(b"image-bytes").decode()
+    reference: Final = json.loads(json.dumps(LangfuseMedia(base64_data_uri=data_uri), cls=EventSerializer))
+    media_id: Final = LangfuseMedia.parse_reference_string(reference)["media_id"]
+    requests: Final[list[httpx.Request]] = []
+    completed: Final[list[str]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        target: Final = "registration" if request.url.path == "/api/public/media" else "confirmation"
+        if request.url.path.startswith("/api/public/media"):
+            attempts: Final = sum(item.method == request.method for item in requests)
+            if target == stage and attempts == 1:
+                return httpx.Response(status, json={"message": "temporary failure"})
+            completed.append(target)
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert (
+        _export_and_flush(exporter, (_generation_span(**{"langfuse.observation.output": data_uri}),))
+        is SpanExportResult.SUCCESS
+    )
+
+    assert completed == ["registration", "confirmation"]
+    assert sum(request.method == "PUT" for request in requests) == 1
+    assert _decoded_attributes(requests[-1].content)["langfuse.observation.output"] == json.dumps(reference)
+
+
+@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("stage", ["registration", "confirmation"])
+@pytest.mark.parametrize("header_format", ["seconds", "date"])
+@pytest.mark.parametrize("raw_note", [None, b"caf\xe9", "测试".encode()], ids=["ascii", "latin-1", "utf-8"])
+def test_exporter_waits_for_media_retry_after_before_retrying_and_completes_the_upload(
+    monkeypatch: pytest.MonkeyPatch, status: int, stage: str, header_format: str, raw_note: bytes | None
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_RETRIES", "1")
+    required_wait: Final = 5
+    waits: Final[list[float]] = []
+    monkeypatch.setattr(backoff_sync, "time", SimpleNamespace(sleep=waits.append))
+    monkeypatch.setattr(langfuse_http_client, "time", SimpleNamespace(time=lambda: CALL_START.timestamp()))
+    retry_after: Final = (
+        str(required_wait)
+        if header_format == "seconds"
+        else format_datetime(CALL_START + timedelta(seconds=required_wait), usegmt=True)
+    )
+    data_uri: Final = "data:image/png;base64," + b64encode(b"image-bytes").decode()
+    reference: Final = json.loads(json.dumps(LangfuseMedia(base64_data_uri=data_uri), cls=EventSerializer))
+    media_id: Final = LangfuseMedia.parse_reference_string(reference)["media_id"]
+    requests: Final[list[httpx.Request]] = []
+    completed: Final[list[str]] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        target: Final = "registration" if request.url.path == "/api/public/media" else "confirmation"
+        if request.url.path.startswith("/api/public/media"):
+            if target == stage and sum(waits) < required_wait:
+                headers: Final = ((b"retry-after", retry_after.encode()),) + (
+                    () if raw_note is None else ((b"x-note", raw_note),)
+                )
+                return httpx.Response(status, headers=headers, json={"message": "wait"})
+            completed.append(target)
+            return httpx.Response(200, json={"mediaId": media_id, "uploadUrl": "https://storage.example/image"})
+        return httpx.Response(200, json={})
+
+    exporter: Final = _build_span_exporter(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://lf.internal.example",
+        handler=HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(transport))),
+    )
+
+    assert (
+        _export_and_flush(exporter, (_generation_span(**{"langfuse.observation.output": data_uri}),))
+        is SpanExportResult.SUCCESS
+    )
+
+    assert waits == [required_wait]
+    assert completed == ["registration", "confirmation"]
+    assert sum(request.method == "PUT" for request in requests) == 1
+    assert _decoded_attributes(requests[-1].content)["langfuse.observation.output"] == json.dumps(reference)
+
+
+@pytest.mark.parametrize("limit", [None, 4096])
+@pytest.mark.parametrize("trace_output_size", [128, 1_100_000])
+def test_exporter_truncates_oversized_output_before_first_post(
+    monkeypatch: pytest.MonkeyPatch, limit: int | None, trace_output_size: int
+) -> None:
+    if limit is None:
+        monkeypatch.delenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", raising=False)
+    else:
+        monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", str(limit))
+    attributes: Final = MappingProxyType(
+        {
+            "langfuse.observation.input": "question",
+            "langfuse.observation.output": "x" * 1_100_000,
+            "langfuse.trace.output": "x" * trace_output_size,
+            "langfuse.observation.model.name": "test-model",
+            "langfuse.observation.usage_details": '{"input":2,"output":3,"total":5}',
+            "langfuse.observation.cost_details": '{"total":0.01}',
+        }
+    )
+    span: Final = _generation_span(**attributes)
+    exporter, seen = _exporter_over([200])
+
+    assert exporter.export((span,)) is SpanExportResult.SUCCESS
+
+    (request,) = seen
+    assert _decoded_attributes(request.content) == {
+        **attributes,
+        "langfuse.observation.output": "<truncated due to size exceeding limit>",
+        "langfuse.trace.output": (
+            "<truncated due to size exceeding limit>"
+            if trace_output_size > (limit or 1_000_000)
+            else "x" * trace_output_size
+        ),
+    }
+    assert span.attributes == attributes
+
+
+@pytest.mark.parametrize("headroom", [-1, 0, 1])
+def test_exporter_applies_the_output_limit_at_the_utf8_byte_boundary(
+    monkeypatch: pytest.MonkeyPatch, headroom: int
+) -> None:
+    output: Final = "界" * 1000
+    span: Final = _generation_span(**{"langfuse.observation.output": output})
+    other: Final = _generation_span(**{"langfuse.observation.output": output})
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", str(len(output.encode("utf-8")) + headroom))
+    exporter, seen = _exporter_over([200])
+
+    assert exporter.export((span, other)) is SpanExportResult.SUCCESS
+
+    (request,) = seen
+    decoded: Final = ExportTraceServiceRequest()
+    decoded.ParseFromString(request.content)
+    exported: Final = decoded.resource_spans[0].scope_spans[0].spans
+    expected: Final = "<truncated due to size exceeding limit>" if headroom < 0 else output
+    assert tuple(item.attributes[0].value.string_value for item in exported) == (expected, expected)
+
+
+@pytest.mark.parametrize("limit", [8000, 4000, 1024])
+def test_exporter_limits_only_output_and_preserves_input_and_metadata(
+    monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", str(limit))
+    span: Final = _generation_span(
+        **{
+            "langfuse.observation.input": "i" * 4000,
+            "langfuse.observation.output": "界" * 2000,
+            "langfuse.observation.metadata.note": "m" * 3000,
+        }
+    )
+    exporter, seen = _exporter_over([200])
+
+    assert exporter.export((span,)) is SpanExportResult.SUCCESS
+
+    (request,) = seen
+    marker: Final = "<truncated due to size exceeding limit>"
+    assert _decoded_attributes(request.content) == {
+        "langfuse.observation.input": "i" * 4000,
+        "langfuse.observation.output": marker if len(("界" * 2000).encode("utf-8")) > limit else "界" * 2000,
+        "langfuse.observation.metadata.note": "m" * 3000,
+    }
+
+
+def test_exporter_still_handles_a_413_after_applying_the_local_event_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "4096")
+    span: Final = _generation_span(
+        **{
+            "langfuse.observation.input": "i" * 2000,
+            "langfuse.observation.output": "o" * 5000,
+            "langfuse.observation.metadata.note": "m" * 1000,
+        }
+    )
+    exporter, seen = _exporter_over([413, 200])
+
+    assert exporter.export((span,)) is SpanExportResult.SUCCESS
+
+    marker: Final = "<truncated due to size exceeding limit>"
+    assert tuple(_decoded_attributes(request.content) for request in seen) == (
+        {
+            "langfuse.observation.input": "i" * 2000,
+            "langfuse.observation.output": marker,
+            "langfuse.observation.metadata.note": "m" * 1000,
+        },
+        {
+            "langfuse.observation.input": "i" * 2000,
+            "langfuse.observation.output": marker,
+            "langfuse.observation.metadata.truncated": marker,
+        },
+    )
+
+
+@pytest.mark.parametrize("surrogate_codepoint", [0xD800, 0xDFFF], ids=["high-surrogate", "low-surrogate"])
+def test_exporter_handles_413_with_lone_surrogate_metadata_and_keeps_healthy_spans(
+    monkeypatch: pytest.MonkeyPatch, surrogate_codepoint: int
+) -> None:
+    monkeypatch.setenv("LANGFUSE_MAX_EVENT_SIZE_BYTES", "1024")
+    oversized: Final = _generation_span(
+        **{
+            "langfuse.observation.input": "i" * 4096,
+            "langfuse.observation.output": "o" * 4096,
+            "langfuse.observation.metadata.note": chr(surrogate_codepoint),
+        }
+    )
+    healthy: Final = _generation_span(**{"langfuse.observation.output": "healthy"})
+    expected: Final = _encode((healthy,))
+    assert expected is not None
+    expected_batch: Final = ExportTraceServiceRequest()
+    expected_batch.ParseFromString(expected)
+    exporter, seen = _exporter_over([413, 413, 200, 200])
+
+    assert exporter.export((oversized, healthy)) is SpanExportResult.SUCCESS
+
+    assert len(seen) == 4
+    decoded: Final = ExportTraceServiceRequest()
+    decoded.ParseFromString(seen[-2].content)
+    exported: Final = decoded.resource_spans[0].scope_spans[0].spans
+    assert tuple(exported) == tuple(expected_batch.resource_spans[0].scope_spans[0].spans)
+    assert _decoded_attributes(seen[-1].content) == {
+        "langfuse.observation.input": "i" * 4096,
+        "langfuse.observation.output": "<truncated due to size exceeding limit>",
+        "langfuse.observation.metadata.truncated": "<truncated due to size exceeding limit>",
+    }
+
+
+def test_exporter_truncates_oversized_output_after_a_413_and_preserves_input(monkeypatch, caplog):
     monkeypatch.setattr("litellm.integrations.langfuse.langfuse_sdk.sleep", lambda _: None)
     span = _generation_span(
         **{
-            "langfuse.observation.input": "data:image/png;base64," + "A" * 6000,
-            "langfuse.trace.input": "data:image/png;base64," + "A" * 200,
-            "langfuse.observation.output": "o" * 1000,
+            "langfuse.observation.input": "question",
+            "langfuse.trace.input": "question",
+            "langfuse.observation.output": "o" * 6000,
+            "langfuse.trace.output": "o" * 200,
             "langfuse.observation.metadata.team": "m" * 100,
             "langfuse.observation.model.name": "gpt-4o",
         }
@@ -1456,15 +2696,16 @@ def test_exporter_truncates_a_single_oversized_span_the_way_v2_did_instead_of_dr
 
     assert result is SpanExportResult.SUCCESS
     delivered = _decoded_attributes(bodies[-1])
-    assert delivered["langfuse.observation.input"] == "<truncated due to size exceeding limit>"
-    assert delivered["langfuse.trace.input"] == "<truncated due to size exceeding limit>"
-    assert delivered["langfuse.observation.output"] == "o" * 1000
+    assert delivered["langfuse.observation.input"] == "question"
+    assert delivered["langfuse.trace.input"] == "question"
+    assert delivered["langfuse.observation.output"] == "<truncated due to size exceeding limit>"
+    assert delivered["langfuse.trace.output"] == "<truncated due to size exceeding limit>"
     assert delivered["langfuse.observation.metadata.team"] == "m" * 100
     assert delivered["langfuse.observation.model.name"] == "gpt-4o"
     assert "dropping it" not in caplog.text and "truncated" in caplog.text
 
 
-def test_exporter_truncates_largest_first_and_drops_only_when_nothing_is_left(monkeypatch, caplog):
+def test_exporter_preserves_input_even_when_the_destination_keeps_rejecting_the_span(monkeypatch, caplog):
     """Langfuse stores a bare ``langfuse.observation.metadata`` string as nothing, so the metadata marker travels
     under a flattened key the way every other metadata value does."""
     monkeypatch.setattr("litellm.integrations.langfuse.langfuse_sdk.sleep", lambda _: None)
@@ -1495,15 +2736,14 @@ def test_exporter_truncates_largest_first_and_drops_only_when_nothing_is_left(mo
     marker = "<truncated due to size exceeding limit>"
     assert [sorted(key for key, value in body.items() if value == marker) for body in posted] == [
         [],
-        ["langfuse.observation.input"],
-        ["langfuse.observation.input", "langfuse.observation.output"],
+        ["langfuse.observation.output"],
         [
-            "langfuse.observation.input",
             "langfuse.observation.metadata.truncated",
             "langfuse.observation.output",
             "langfuse.trace.metadata.truncated",
         ],
     ]
+    assert all(body["langfuse.observation.input"] == "i" * 3000 for body in posted)
     assert "langfuse.observation.metadata.a" not in posted[-1] and "langfuse.trace.metadata.b" not in posted[-1]
     assert "dropping it" in caplog.text
 
@@ -1564,14 +2804,10 @@ def test_exporter_reports_failure_when_no_span_of_the_batch_can_be_encoded(monke
     assert seen == []
 
 
-def test_built_exporter_uses_the_shared_litellm_handler_and_langfuse_headers(monkeypatch):
-    """No private requests session or TLS adapter: the channel is the same handler the rest of litellm uses."""
-    from litellm.llms.custom_httpx.http_handler import get_httpx_client
-
+def test_built_exporter_honors_litellm_timeout_and_langfuse_headers(monkeypatch):
     monkeypatch.delenv("LANGFUSE_TIMEOUT", raising=False)
     monkeypatch.delenv("LANGFUSE_MAX_RETRIES", raising=False)
     default = _build_span_exporter(public_key="pk", secret_key="sk", base_url="https://lf.internal.example")
-    assert default.handler is get_httpx_client()
     assert default.timeout == 20
     assert len(default.delays) == 3
 

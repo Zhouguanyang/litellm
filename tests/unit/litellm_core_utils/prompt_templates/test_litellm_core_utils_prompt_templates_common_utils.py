@@ -1,3 +1,4 @@
+import base64
 import copy
 import json
 from collections.abc import Mapping
@@ -11,6 +12,9 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
     TOOL_RESULT_MEDIA_BOUNDARY,
     TOOL_RESULT_MEDIA_PLACEHOLDER,
     add_system_prompt_to_messages,
+    base64_media_data_uri,
+    google_generate_content_input,
+    image_response_data_uri,
     get_content_from_model_response,
     get_semantic_cache_prompt_from_messages,
     get_str_from_messages,
@@ -1012,3 +1016,78 @@ def test_get_content_from_model_response_includes_server_tool_calls_before_clien
     assert get_content_from_model_response(response) == (
         "Looking it up." + server_call.model_dump_json() + client_call.model_dump_json()
     )
+
+
+@pytest.mark.parametrize("field", ["b64_json", "result"])
+def test_generated_image_data_uri_preserves_image_bytes_and_detects_the_content_type(field: str) -> None:
+    image: Final = b"RIFFxxxxWEBP" + b"image-bytes"
+    encoded: Final = base64.b64encode(image).decode()
+    part: Final = {"type": "image_generation_call", "result": encoded} if field == "result" else {"b64_json": encoded}
+
+    result: Final = image_response_data_uri(part)
+
+    assert result == (field, f"data:image/webp;base64,{encoded}")
+    assert base64.b64decode(result[1].split(",", 1)[1]) == image
+
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"b64_json": None},
+        {"b64_json": ""},
+        {"b64_json": "invalid-base64"},
+        {"b64_json": "测试"},
+        {"b64_json": base64.b64encode(b"ordinary text").decode()},
+        {"type": "function_call_output", "result": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()},
+    ],
+)
+def test_generated_image_data_uri_does_not_treat_other_results_as_images(part: Mapping[str, object]) -> None:
+    assert image_response_data_uri(part) is None
+
+
+
+@pytest.mark.parametrize(
+    "shape", ["data-uri", "anthropic", "vertex", "gemini-camel", "gemini-snake", "images", "responses"]
+)
+def test_base64_media_data_uri_preserves_the_payload_and_identifies_its_field(shape: str) -> None:
+    image: Final = b"\x89PNG\r\n\x1a\n" + b"image-bytes"
+    encoded: Final = base64.b64encode(image).decode()
+    data_uri: Final = f"data:image/png;base64,{encoded}"
+    value, path = {
+        "data-uri": (data_uri, ()),
+        "anthropic": ({"type": "base64", "media_type": "image/png", "data": encoded}, ("data",)),
+        "vertex": ({"type": "media", "mime_type": "image/png", "data": encoded}, ("data",)),
+        "gemini-camel": ({"inlineData": {"mimeType": "image/png", "data": encoded}}, ("inlineData", "data")),
+        "gemini-snake": ({"inline_data": {"mime_type": "image/png", "data": encoded}}, ("inline_data", "data")),
+        "images": ({"b64_json": encoded}, ("b64_json",)),
+        "responses": ({"type": "image_generation_call", "result": encoded}, ("result",)),
+    }[shape]
+
+    assert base64_media_data_uri(value) == (path, data_uri)
+
+
+
+def test_google_generate_content_input_keeps_context_and_excludes_transport_options() -> None:
+    context: Final = {
+        "contents": [{"role": "user", "parts": [{"text": "context"}]}],
+        "systemInstruction": {"parts": [{"text": "system"}]},
+        "tools": [{"functionDeclarations": [{"name": "lookup"}]}],
+        "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+        "cachedContent": "cachedContents/example",
+        "continuationToken": "opaque-context-token",
+    }
+    request: Final = {
+        **context,
+        "model": "example-model",
+        "generationConfig": {"temperature": 0.5},
+        "api_key": "test-secret",
+    }
+
+    assert google_generate_content_input(request) == context
+    assert request == {
+        **context,
+        "model": "example-model",
+        "generationConfig": {"temperature": 0.5},
+        "api_key": "test-secret",
+    }
